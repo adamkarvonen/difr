@@ -10,10 +10,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import torch
 from datasets import load_dataset
-from scipy.special import roots_hermite
 from tqdm import tqdm
 from transformers import (
     AutoTokenizer,
