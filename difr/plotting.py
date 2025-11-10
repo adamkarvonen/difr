@@ -488,7 +488,7 @@ def analyze_with_classifiers_by_file(
 if __name__ == "__main__":
     # Setup data directory
     data_dir = "meta-llama_Llama-3_1-8B-Instruct_results"
-    data_dir = "token_difr_results"
+    # data_dir = "token_difr_results"
     model_type = "Llama-3.1-8B"
 
     # data_dir = "Qwen_Qwen3-8B_results"
@@ -502,6 +502,8 @@ if __name__ == "__main__":
         "exact_match",
         "prob",
         "margin",
+        # "toploc_metrics",
+        # "down_proj_distances",
     ]
 
     # Setup parameters
@@ -539,7 +541,7 @@ if __name__ == "__main__":
         image_folder=image_folder,
         model_type=model_type,
         down_proj_dim=8,
-        bucket_sizes=[1, 3, 10, 30, 100, 300, 1000],
+        bucket_sizes=[1, 3, 10, 30, 100, 300],
         test_size=0.5,
         random_state=43,
         save_plots=True,

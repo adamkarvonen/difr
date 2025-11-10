@@ -35,8 +35,8 @@ class AttestationConfig:
     dataset_config: str | None = None
 
     # Sampling parameters
-    sampling_temperature: float = 0.7
-    verification_temperature: float = 0.7
+    sampling_temperature: float = 1.0
+    verification_temperature: float = 1.0
     top_k: int = 50
     sampling_top_p: float = 0.95
     verification_top_p: float = 0.95

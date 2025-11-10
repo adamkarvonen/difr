@@ -272,7 +272,7 @@ def compute_margin(
     # Difference in observed logits
     logit_diff = logits_V[max_token] - logits_V[gold_idx]
 
-    return logit_diff.float().item()
+    return float(logit_diff.float().item())
 
 
 def simulated_likelihood_estimator(
@@ -454,7 +454,7 @@ def get_act_metrics(
     mean_logit = logits_V.mean().item()
     temperature = max(temperature, 1e-8)
     log_z = torch.logsumexp(logits_V / temperature, dim=-1)
-    softmax_denominator = torch.exp(log_z).float().item()
+    softmax_denominator = float(torch.exp(log_z).float().item())
 
     toploc_proofs = {}
     for topk in down_proj_matrices:
@@ -839,7 +839,7 @@ def verify_outputs(
             noisy_probs_V = prob_V.div(noise_V)
             pred_id = noisy_probs_V.argmax(dim=-1)
 
-            rank = (noisy_probs_V > noisy_probs_V[actual_token_idx]).sum().item()
+            rank = int((noisy_probs_V > noisy_probs_V[actual_token_idx]).sum().item())
 
             margin = compute_margin(
                 logits_V.clone(),
@@ -864,9 +864,9 @@ def verify_outputs(
             orig_mean_logit = vllm_seq_act_metrics[j].mean_logit
             orig_softmax_denominator = vllm_seq_act_metrics[j].softmax_denominator
 
-            denominator_distance = act_metrics.softmax_denominator - orig_softmax_denominator
-            mean_act_distance = act_metrics.mean_act - orig_mean_acts
-            mean_logit_distance = act_metrics.mean_logit - orig_mean_logit
+            denominator_distance = float(act_metrics.softmax_denominator - orig_softmax_denominator)
+            mean_act_distance = float(act_metrics.mean_act - orig_mean_acts)
+            mean_logit_distance = float(act_metrics.mean_logit - orig_mean_logit)
 
             toploc_metrics = {}
             for topk in cfg.down_proj_dims:
@@ -876,10 +876,20 @@ def verify_outputs(
                     decode_batching_size=1,
                     topk=topk,
                 )
+                # Convert to Python floats to avoid tensor issues
+                exp_mismatches = topk_toploc_results[0].exp_mismatches
+                mant_err_mean = topk_toploc_results[0].mant_err_mean
+                mant_err_median = topk_toploc_results[0].mant_err_median
+                if isinstance(exp_mismatches, torch.Tensor):
+                    exp_mismatches = float(exp_mismatches.item())
+                if isinstance(mant_err_mean, torch.Tensor):
+                    mant_err_mean = float(mant_err_mean.item())
+                if isinstance(mant_err_median, torch.Tensor):
+                    mant_err_median = float(mant_err_median.item())
                 toploc_metrics[topk] = (
-                    topk_toploc_results[0].exp_mismatches,
-                    topk_toploc_results[0].mant_err_mean,
-                    topk_toploc_results[0].mant_err_median,
+                    exp_mismatches,
+                    mant_err_mean,
+                    mant_err_median,
                 )
 
             down_proj_distances = {}
@@ -897,9 +907,9 @@ def verify_outputs(
                 denominator_distance=denominator_distance,
                 mean_act_distance=mean_act_distance,
                 mean_logit_distance=mean_logit_distance,
-                exact_match=pred_id == actual_id,
-                prob=prob_V[actual_token_idx].item(),
-                margin=margin,
+                exact_match=bool(pred_id == actual_id),
+                prob=float(prob_V[actual_token_idx].item()),
+                margin=float(margin),
                 down_proj_distances=down_proj_distances,
                 token_index=j,  # 0-based index within this completion
                 rank=rank,
@@ -1105,8 +1115,8 @@ if __name__ == "__main__":
         filenames = []
         for i in range(len(cfgs)):
             cfgs[i].hf_batch_size = hf_batch_size
-            cfgs[i].n_samples = 20  # Smoketest: small sample
-            cfgs[i].max_decode_tokens = 50  # Smoketest: minimal tokens
+            cfgs[i].n_samples = 200  # Smoketest: small sample
+            cfgs[i].max_decode_tokens = 200  # Smoketest: minimal tokens
             cfgs[i].save_dir = f"{model_name_str}_results"
             filenames.append(cfgs[i].save_filename)
 
