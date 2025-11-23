@@ -410,7 +410,8 @@ def verify_outputs(
         J = logits_JV.shape[0]
 
         if J == 0:
-            raise ValueError("No generated tokens in sequence")
+            # raise ValueError("No generated tokens in sequence")
+            continue
 
         k_vec = torch.as_tensor([cfg.top_k], device=logits_LV.device, dtype=torch.long).expand(J)
         p_vec = torch.as_tensor([cfg.verification_top_p], device=logits_LV.device, dtype=probs_JV.dtype).expand(J)
@@ -688,10 +689,38 @@ if __name__ == "__main__":
         )
     )
 
+    external_prompt_filename = (
+        "openrouter_responses/openrouter_cerebras_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+    )
+
+    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{external_save_filename}.pkl",
+            trusted_model_name=model_name,
+            external_prompt_filename=external_prompt_filename,
+        )
+    )
+
+    external_prompt_filename = (
+        "openrouter_responses/openrouter_deepinfra_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+    )
+
+    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{external_save_filename}.pkl",
+            trusted_model_name=model_name,
+            external_prompt_filename=external_prompt_filename,
+        )
+    )
+
     # Apply smoketest settings to all configs
     filenames = []
     for i in range(len(cfgs)):
-        cfgs[i].n_samples = 500
+        cfgs[i].n_samples = 2000
         cfgs[i].max_decode_tokens = 500
         cfgs[i].sampling_temperature = 0.0
         cfgs[i].verification_temperature = 0.0

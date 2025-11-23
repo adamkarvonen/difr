@@ -116,9 +116,9 @@ async def main():
     temperature = 0.0
     concurrency = 50
 
-    for provider in ["hyperbolic", "groq", "siliconflow/fp8"]:
+    for provider in ["cerebras", "hyperbolic", "groq", "siliconflow/fp8", "deepinfra"]:
         save_dir = Path("openrouter_responses")
-        n_samples = 500
+        n_samples = 2000
         max_ctx_len = 512
 
         # Load OpenRouter API key from file to keep the script simple.

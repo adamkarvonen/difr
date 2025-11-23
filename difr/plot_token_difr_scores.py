@@ -9,7 +9,6 @@ import pickle
 from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -17,13 +16,53 @@ import numpy as np
 # Configuration constants
 # ============================================================================
 RESULTS_DIR = "token_difr_results"
-METRIC = "margin"
-METRIC = "prob"
 TRUSTED_FILENAME = "token_difr_results/verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.pkl"
 
 # Global variables to store percentile thresholds
 MARGIN_PERCENTILE_99_9 = None
 PROB_PERCENTILE_99_9 = None
+
+
+def get_pretty_name(file_name: str) -> str:
+    """Convert file name to a prettier display name for legends and labels.
+
+    Args:
+        file_name: The file name (without path, with or without .pkl extension)
+
+    Returns:
+        Pretty display name
+    """
+    # Remove .pkl extension if present
+    name = file_name.replace(".pkl", "")
+
+    # Handle OpenRouter files with providers
+    if "openrouter" in name.lower():
+        if "siliconflow" in name.lower():
+            return "SiliconFlow"
+        elif "hyperbolic" in name.lower():
+            return "Hyperbolic"
+        elif "deepinfra" in name.lower():
+            return "DeepInfra"
+        elif "cerebras" in name.lower():
+            return "Cerebras"
+        elif "groq" in name.lower():
+            return "Groq"
+        else:
+            # Generic OpenRouter fallback
+            return "OpenRouter"
+
+    # Handle vLLM quantization types
+    if "_vllm_4bit" in name:
+        return "4-bit"
+    elif "_vllm_bf16" in name:
+        return "BF16"
+    elif "_vllm_fp8_kv" in name:
+        return "FP8 KV Cache"
+    elif "_vllm_fp8" in name:
+        return "FP8"
+
+    # Fallback: return original name with some cleanup
+    return name.replace("verification_", "").replace("_", " ").title()
 
 
 # Define SimpleTokenMetrics locally
@@ -150,8 +189,10 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
     # Extract scores and calculate statistics for each file
     file_stats = {}
     file_names = []
+    pretty_names = []
     for pickle_file, data in all_data.items():
         file_name = Path(pickle_file).stem
+        pretty_name = get_pretty_name(file_name)
         try:
             scores = extract_all_scores(data, metric)
             if scores:
@@ -160,7 +201,8 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
                 n_tokens = len(scores)
                 file_stats[file_name] = {"mean": mean_score, "std": std_score, "n": n_tokens}
                 file_names.append(file_name)
-                print(f"{file_name}: Tokens: {n_tokens}, Mean: {mean_score:.6f}, Std: {std_score:.6f}")
+                pretty_names.append(pretty_name)
+                print(f"{pretty_name}: Tokens: {n_tokens}, Mean: {mean_score:.6f}, Std: {std_score:.6f}")
         except Exception as e:
             print(f"Error processing {file_name}: {e}")
             continue
@@ -198,27 +240,24 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
             fontsize=9,
         )
 
-    # Create legend entries
-    legend_elements = [
-        mpatches.Rectangle((0, 0), 1, 1, facecolor=colors[i], alpha=0.7, label=file_names[i])
-        for i in range(len(file_names))
-    ]
+    # Add labels directly under each bar
+    for bar, pretty_name in zip(bars, pretty_names):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            -max(means) * 0.05,  # Position below the x-axis
+            pretty_name,
+            ha="center",
+            va="top",
+            fontsize=9,
+            rotation=45 if len(pretty_name) > 15 else 0,  # Rotate long labels
+        )
 
     # Set labels and title
     ax.set_ylabel(f"{metric.capitalize()} Score (Mean)", fontsize=12)
-    ax.set_xlabel("File Index", fontsize=12)
-    ax.set_xticks(positions)
-    ax.set_xticklabels([str(i) for i in positions])
+    ax.set_xlabel("")  # Remove x-axis label
+    ax.set_xticks([])  # Remove x-axis ticks
+    ax.set_xticklabels([])  # Remove x-axis tick labels
     ax.grid(True, alpha=0.3, axis="y")
-
-    # Add legend below the plot
-    ax.legend(
-        handles=legend_elements,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.15),
-        ncol=1,
-        frameon=True,
-    )
 
     # Set y-axis limits with padding for text labels
     y_max = max(means)
@@ -226,13 +265,25 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
     padding = (y_max - y_min) * 0.2 if y_max != y_min else y_max * 0.2
     ax.set_ylim(min(0, y_min - padding), y_max + padding)
 
-    # Set title
+    # Set title based on metric
     total_tokens = sum(stats["n"] for stats in file_stats.values())
-    title = f"{metric.capitalize()} Mean by Model"
+    if metric == "margin":
+        title = "Mean Token-DIFR Score by Model"
+    elif metric == "prob":
+        title = "Mean Cross Entropy by Model"
+    else:
+        title = f"{metric.capitalize()} Mean by Model"
     ax.set_title(title, fontsize=13, pad=15)
 
-    # Adjust layout to make room for legend below
-    plt.tight_layout(rect=(0, 0.1, 1, 1))
+    # Adjust layout to make room for labels below bars
+    plt.tight_layout(rect=(0, 0.15, 1, 1))
+
+    # Print file names with corresponding values
+    print(f"\nFile names and {metric} values:")
+    print("-" * 70)
+    for pretty_name, mean_val in zip(pretty_names, means):
+        print(f"{pretty_name}: {mean_val:.6f}")
+    print("-" * 70)
 
     # Save the plot
     output_file = f"combined_bar_{metric}.png"
@@ -261,7 +312,6 @@ def main():
         return
 
     print(f"Found {len(pickle_files)} pickle files")
-    print(f"Metric: {METRIC}")
     print("=" * 70)
 
     # Load all pickle files
@@ -277,12 +327,13 @@ def main():
             continue
 
     print("=" * 70)
-    print("Creating combined bar chart...")
 
-    # Create combined bar chart
-    create_combined_bar_plot(all_data, METRIC)
+    # Iterate over both metrics
+    for metric in ["margin", "prob", "exact_match"]:
+        print(f"Creating combined bar chart for metric: {metric}...")
+        create_combined_bar_plot(all_data, metric)
+        print("=" * 70)
 
-    print("=" * 70)
     print(f"Processed {len(all_data)} files")
 
 
