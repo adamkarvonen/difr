@@ -38,13 +38,7 @@ class TokenMetrics:
 class SimpleTokenMetrics:
     exact_match: bool
     prob: float
-    sampler_scores: dict[float, float]
-    mc_scores: dict[float, float]
-    mc_gaussian_logit_perturbation_scores: dict[float, float]
-    fast_gaussian_logit_perturbation_scores: dict[float, float]
-    fast_gaussian_scores: dict[float, float]
-    gumbel_max_score: float
-    pairwise_gumbel_scores: dict[float, float]
+    margin: float
 
 
 SCORE_KEY_TO_LABEL = {
@@ -488,6 +482,7 @@ def analyze_with_classifiers_by_file(
 if __name__ == "__main__":
     # Setup data directory
     data_dir = "meta-llama_Llama-3_1-8B-Instruct_results"
+    data_dir = "token_difr_results"
     # data_dir = "token_difr_results"
     model_type = "Llama-3.1-8B"
 

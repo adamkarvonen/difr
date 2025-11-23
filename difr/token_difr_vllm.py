@@ -4,6 +4,7 @@ import os
 os.environ["VLLM_USE_V1"] = "0"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import json
 import gc
 import pickle
 from dataclasses import asdict, dataclass, field
@@ -40,6 +41,8 @@ class AttestationConfig:
     verification_top_p: float = 0.95
     sampling_seed: int = 42
     verification_seed: int = 42
+
+    external_prompt_filename: str | None = None
 
     save_dir: str = "token_difr_attestation_results"
     save_filename: str = "attestation_results.pkl"
@@ -405,6 +408,10 @@ def verify_outputs(
 
         # Build per-row k/p for masking
         J = logits_JV.shape[0]
+
+        if J == 0:
+            raise ValueError("No generated tokens in sequence")
+
         k_vec = torch.as_tensor([cfg.top_k], device=logits_LV.device, dtype=torch.long).expand(J)
         p_vec = torch.as_tensor([cfg.verification_top_p], device=logits_LV.device, dtype=probs_JV.dtype).expand(J)
 
@@ -451,7 +458,7 @@ def verify_outputs(
     return all_token_metrics
 
 
-def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str]]:
+def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str], list[list[dict[str, str]]]]:
     tokenizer = AutoTokenizer.from_pretrained(cfg.trusted_model_name)
     tokenizer.padding_side = "left"
 
@@ -461,29 +468,111 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
 
     tokenized_prompts = []
     hf_prompts = []  # used because we need to add padding to prompts with hf
+    conversation_prompts = []
     unique_prompts = set()
+
+    system_prompt = []
 
     count = 0
     while len(tokenized_prompts) < cfg.n_samples:
-        raw_prompt = ds[count]["conversation"]
-        rendered_prompt = tokenizer.apply_chat_template(raw_prompt, tokenize=False, add_generation_prompt=True)
+        raw_prompt = ds[count]["conversation"]  # type: ignore[index]
+
+        # Check language before processing
+        if ds[count]["language"].lower() != "english":  # type: ignore[index]
+            count += 1
+            continue
+
+        count += 1
+
+        # Only include conversations that end with a user message
+        # If it ends with assistant, remove the last assistant message(s) to ensure
+        # the model has something to respond to
+        conversation = list(raw_prompt)  # Convert to list to allow modification
+        conversation = system_prompt + conversation
+        while conversation and conversation[-1].get("role") == "assistant":
+            conversation = conversation[:-1]
+
+        if "qwen" in cfg.trusted_model_name.lower():
+            conversation[-1]["content"] = conversation[-1]["content"] + "/nothink"
+
+        # Skip if conversation is empty or doesn't end with user
+        if not conversation or conversation[-1].get("role") != "user":
+            continue
+
+        rendered_prompt = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         tokenized_prompt = tokenizer.encode(rendered_prompt, add_special_tokens=False, return_tensors=None)
         if len(tokenized_prompt) <= cfg.max_ctx_len:
             if tuple(tokenized_prompt) not in unique_prompts:
                 unique_prompts.add(tuple(tokenized_prompt))
                 tokenized_prompts.append(tokenized_prompt)
                 hf_prompts.append(rendered_prompt)
-        count += 1
+                conversation_prompts.append(conversation)
 
     # We haven't properly set the pad token yet so we need to delete the tokenizer
     del tokenizer
 
-    return tokenized_prompts, hf_prompts
+    return tokenized_prompts, hf_prompts, conversation_prompts
 
 
-def run(cfg: AttestationConfig) -> None:
+def load_external_tokens(data_path: str) -> list[VllmStyleRequestOutput]:
+    """Load external tokenized data from JSON file in VLLM-style format.
+
+    Expected JSON format:
+    {
+        "config": {
+            "model": str,
+            "temperature": float,
+            ...
+        },
+        "samples": [
+            {
+                "prompt_token_ids": list[int],
+                "outputs": [
+                    {
+                        "token_ids": list[int]
+                    }
+                ]
+            },
+            ...
+        ]
+    }
+
+    Args:
+        data_path: Path to the JSON file containing tokenized data
+
+    Returns:
+        List of VllmStyleRequestOutput objects with prompt_token_ids and outputs
+    """
+    # Load the JSON file
+    with open(data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    # Verify config exists
+    assert "config" in data, "Config not found in data"
+    assert "samples" in data, "Samples not found in data"
+
+    # Convert JSON samples to VllmStyleRequestOutput objects
+    vllm_style_outputs = []
+    for sample in data["samples"]:
+        assert "prompt_token_ids" in sample, "prompt_token_ids not found in sample"
+        assert "outputs" in sample, "outputs not found in sample"
+        assert "token_ids" in sample["outputs"][0], "token_ids not found in output"
+
+        vllm_style_outputs.append(
+            VllmStyleRequestOutput(
+                prompt_token_ids=sample["prompt_token_ids"],
+                outputs=[CompletionOutput(token_ids=output["token_ids"]) for output in sample["outputs"]],
+            )
+        )
+
+    return vllm_style_outputs
+
+
+def run(
+    cfg: AttestationConfig,
+    external_responses: list[VllmStyleRequestOutput] | None = None,
+) -> None:
     dtype = torch.bfloat16
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
     save_path = Path(cfg.save_dir) / cfg.save_filename
@@ -496,13 +585,16 @@ def run(cfg: AttestationConfig) -> None:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    tokenized_prompts, hf_prompts = construct_dataset(cfg)
+    if external_responses is None:
+        tokenized_prompts, hf_prompts, conversation_prompts = construct_dataset(cfg)
 
-    untrusted_outputs = generate_outputs_vllm(
-        cfg,
-        tokenized_prompts,
-        dtype,
-    )
+        untrusted_outputs = generate_outputs_vllm(
+            cfg,
+            tokenized_prompts,
+            dtype,
+        )
+    else:
+        untrusted_outputs = external_responses
 
     verifier_scores = verify_outputs(untrusted_outputs, cfg, dtype)
 
@@ -517,6 +609,7 @@ def run(cfg: AttestationConfig) -> None:
 
 
 if __name__ == "__main__":
+    model_name = "Qwen/Qwen3-8B"
     model_name = "meta-llama/Llama-3.1-8B-Instruct"
     model_name_str = model_name.replace("/", "_").replace(".", "_")
     cfgs = []
@@ -529,7 +622,22 @@ if __name__ == "__main__":
         )
     )
 
-    # 2. KV cache quantization (FP8)
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{model_name_str}_vllm_fp8.pkl",
+            trusted_model_name=model_name,
+            vllm_args={"quantization": "fp8"},
+        )
+    )
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{model_name_str}_vllm_4bit.pkl",
+            trusted_model_name=model_name,
+            vllm_args={"quantization": "bitsandbytes"},
+        )
+    )
+
     cfgs.append(
         AttestationConfig(
             save_filename=f"verification_{model_name_str}_vllm_fp8_kv.pkl",
@@ -538,11 +646,55 @@ if __name__ == "__main__":
         )
     )
 
+    external_prompt_filename = (
+        "openrouter_responses/openrouter_groq_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+    )
+
+    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{external_save_filename}.pkl",
+            trusted_model_name=model_name,
+            external_prompt_filename=external_prompt_filename,
+        )
+    )
+
+    external_prompt_filename = (
+        "openrouter_responses/openrouter_hyperbolic_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+    )
+
+    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{external_save_filename}.pkl",
+            trusted_model_name=model_name,
+            external_prompt_filename=external_prompt_filename,
+        )
+    )
+
+    external_prompt_filename = (
+        "openrouter_responses/openrouter_siliconflow_fp8_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+    )
+
+    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+
+    cfgs.append(
+        AttestationConfig(
+            save_filename=f"verification_{external_save_filename}.pkl",
+            trusted_model_name=model_name,
+            external_prompt_filename=external_prompt_filename,
+        )
+    )
+
     # Apply smoketest settings to all configs
     filenames = []
     for i in range(len(cfgs)):
-        cfgs[i].n_samples = 200  # Smoketest: small sample
-        cfgs[i].max_decode_tokens = 200  # Smoketest: minimal tokens
+        cfgs[i].n_samples = 500
+        cfgs[i].max_decode_tokens = 500
+        cfgs[i].sampling_temperature = 0.0
+        cfgs[i].verification_temperature = 0.0
         cfgs[i].save_dir = "token_difr_results"
         filenames.append(cfgs[i].save_filename)
 
@@ -557,6 +709,11 @@ if __name__ == "__main__":
 
     for i, cfg in enumerate(cfgs, 1):
         print(f"[{i}/{len(cfgs)}] Running: {cfg.save_filename}")
-        run(cfg)
+
+        external_responses = None
+        if cfg.external_prompt_filename is not None:
+            external_responses = load_external_tokens(cfg.external_prompt_filename)
+
+        run(cfg, external_responses)
         print(f"✓ Complete: {cfg.save_filename}")
         print()
