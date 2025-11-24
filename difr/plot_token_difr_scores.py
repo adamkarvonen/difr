@@ -234,7 +234,7 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
             text_y,
-            f"μ={mean_val:.4f}",
+            f"{mean_val:.4f}",
             ha="center",
             va="bottom",
             fontsize=9,
@@ -253,7 +253,20 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
         )
 
     # Set labels and title
-    ax.set_ylabel(f"{metric.capitalize()} Score (Mean)", fontsize=12)
+    if metric == "margin":
+        ylabel = "Token-DIFR Score"
+        title = "Mean Token-DIFR Score by Model"
+    elif metric == "prob":
+        ylabel = "Cross Entropy"
+        title = "Mean Cross Entropy by Model"
+    elif metric == "exact_match":
+        ylabel = "Exact Match Rate"
+        title = "Mean Exact Match Rate by Model"
+    else:
+        ylabel = f"{metric.capitalize()} Score"
+        title = f"Mean {metric.capitalize()} by Model"
+
+    ax.set_ylabel(ylabel, fontsize=12)
     ax.set_xlabel("")  # Remove x-axis label
     ax.set_xticks([])  # Remove x-axis ticks
     ax.set_xticklabels([])  # Remove x-axis tick labels
@@ -266,13 +279,6 @@ def create_combined_bar_plot(all_data: dict, metric: str = "margin"):
     ax.set_ylim(min(0, y_min - padding), y_max + padding)
 
     # Set title based on metric
-    total_tokens = sum(stats["n"] for stats in file_stats.values())
-    if metric == "margin":
-        title = "Mean Token-DIFR Score by Model"
-    elif metric == "prob":
-        title = "Mean Cross Entropy by Model"
-    else:
-        title = f"{metric.capitalize()} Mean by Model"
     ax.set_title(title, fontsize=13, pad=15)
 
     # Adjust layout to make room for labels below bars
@@ -329,7 +335,8 @@ def main():
     print("=" * 70)
 
     # Iterate over both metrics
-    for metric in ["margin", "prob", "exact_match"]:
+    # for metric in ["margin", "prob", "exact_match"]:
+    for metric in ["exact_match"]:
         print(f"Creating combined bar chart for metric: {metric}...")
         create_combined_bar_plot(all_data, metric)
         print("=" * 70)
