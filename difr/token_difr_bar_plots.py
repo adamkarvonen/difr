@@ -29,6 +29,13 @@ import numpy as np
 RESULTS_DIR = "token_difr_results"
 TRUSTED_FILENAME = f"{RESULTS_DIR}/verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.pkl"
 
+# Text size constants
+FONTSIZE_BAR_LABELS = 12  # Numbers above bars
+FONTSIZE_AXIS_LABELS = 14  # X and Y axis labels
+FONTSIZE_TITLE = 16  # Chart title
+FONTSIZE_TICK_LABELS = 14  # X and Y axis tick labels
+FONTSIZE_LEGEND = 11  # Legend text
+
 # Global variables to store percentile thresholds
 MARGIN_PERCENTILE_99_9: float | None = None
 PROB_PERCENTILE_99_9: float | None = None
@@ -39,6 +46,12 @@ class SimpleTokenMetrics:
     exact_match: bool
     prob: float
     margin: float
+
+
+def is_local_baseline(file_name: str) -> bool:
+    """Check if a file represents a local baseline (vLLM quantization)."""
+    name = file_name.lower()
+    return any(x in name for x in ["_vllm_4bit", "_vllm_bf16", "_vllm_fp8_kv", "_vllm_fp8"])
 
 
 def get_pretty_name(file_name: str) -> str:
@@ -62,13 +75,13 @@ def get_pretty_name(file_name: str) -> str:
 
     # Handle vLLM quantization types
     if "_vllm_4bit" in name:
-        return "4-bit"
+        return "4-bit (local)"
     if "_vllm_bf16" in name:
-        return "BF16"
+        return "BF16 (local)"
     if "_vllm_fp8_kv" in name:
-        return "FP8 KV Cache"
+        return "FP8 KV Cache (local)"
     if "_vllm_fp8" in name:
-        return "FP8"
+        return "FP8 (local)"
 
     # Fallback: basic cleanup
     return name.replace("verification_", "").replace("_", " ").title()
@@ -126,7 +139,9 @@ def extract_all_scores(data: Dict, metric: str) -> List[float]:
         for token_metric in sequence_metrics:
             if metric == "margin":
                 if MARGIN_PERCENTILE_99_9 is None:
-                    raise RuntimeError("MARGIN_PERCENTILE_99_9 not initialized. Call calculate_percentile_thresholds().")
+                    raise RuntimeError(
+                        "MARGIN_PERCENTILE_99_9 not initialized. Call calculate_percentile_thresholds()."
+                    )
                 score = token_metric.margin
                 if math.isinf(score) or math.isnan(score) or score > MARGIN_PERCENTILE_99_9:
                     score = MARGIN_PERCENTILE_99_9
@@ -181,14 +196,14 @@ def compute_file_stats(all_data: Dict[str, Dict], metric: str) -> Tuple[List[str
 
 
 def _metric_axis_label_and_title(metric: str) -> Tuple[str, str]:
+    # Return metric-specific y-axis label and empty string for title
     if metric == "margin":
-        return "Token-DIFR Score", "Mean Token-DIFR Score by Model"
+        return "Mean Token-DIFR Score", ""
     if metric == "prob":
-        return "Cross Entropy", "Mean Cross Entropy by Model"
+        return "Mean Cross-Entropy", ""
     if metric == "exact_match":
-        return "Exact Match Rate", "Mean Exact Match Rate by Model"
-    label = f"{metric.capitalize()} Score"
-    return label, f"Mean {label} by Model"
+        return "Mean Exact-Match Rate", ""
+    return "Score", ""
 
 
 def _compute_ylim(means: List[float], metric: str) -> Tuple[float, float]:
@@ -222,27 +237,67 @@ def _compute_ylim(means: List[float], metric: str) -> Tuple[float, float]:
 
 
 def plot_metric_bar_chart(pretty_names: List[str], means: List[float], metric: str, output_file: str) -> None:
-    """Plot a single bar chart for a metric using standard x-axis labels."""
+    """Plot a bar chart for providers and horizontal lines for local baselines."""
     if not pretty_names or not means:
         print(f"No data available for metric '{metric}', skipping plot.")
         return
 
-    positions = np.arange(len(pretty_names))
+    # Separate local baselines from providers
+    provider_names: List[str] = []
+    provider_means: List[float] = []
+    baseline_names: List[str] = []
+    baseline_means: List[float] = []
 
-    fig, ax = plt.subplots(figsize=(max(8.0, len(pretty_names) * 0.7), 6.0))
+    for name, mean_val in zip(pretty_names, means):
+        if name.endswith(" (local)"):
+            baseline_names.append(name)
+            baseline_means.append(mean_val)
+        else:
+            provider_names.append(name)
+            provider_means.append(mean_val)
+
+    # Only plot bars for providers
+    if not provider_names:
+        print(f"No provider data available for metric '{metric}', skipping plot.")
+        return
+
+    positions = np.arange(len(provider_names))
+
+    fig, ax = plt.subplots(figsize=(max(8.0, len(provider_names) * 0.7), 6.0))
 
     cmap = plt.get_cmap("tab20")
-    colors = [cmap(i / max(1, len(pretty_names) - 1)) for i in range(len(pretty_names))]
+    colors = [cmap(i / max(1, len(provider_names) - 1)) for i in range(len(provider_names))]
 
-    bars = ax.bar(positions, means, color=colors, alpha=0.8)
+    bars = ax.bar(positions, provider_means, color=colors, alpha=0.8)
 
-    y_bottom, y_top = _compute_ylim(means, metric)
+    # Plot horizontal lines for local baselines
+    baseline_colors = ["red", "blue", "green", "orange", "purple", "brown"]
+    baseline_handles = []
+    for i, (baseline_name, baseline_mean) in enumerate(zip(baseline_names, baseline_means)):
+        color = baseline_colors[i % len(baseline_colors)]
+        # Format label: "4-bit (local)" -> "4-bit local (Score = 0.0069)" with "local" in italics
+        base_name = baseline_name.replace(" (local)", "")
+        # Use math mode for italics (works with matplotlib's default math rendering)
+        label_with_value = f"{base_name} $\\mathit{{local}}$ (Score = {baseline_mean:.4f})"
+        line = ax.axhline(
+            y=baseline_mean,
+            color=color,
+            linestyle="--",
+            linewidth=2,
+            alpha=0.75,
+            label=label_with_value,
+        )
+        baseline_handles.append(line)
+
+    # Compute y-limits including baselines
+    all_means = provider_means + baseline_means
+    y_bottom, y_top = _compute_ylim(all_means, metric)
     ax.set_ylim(y_bottom, y_top)
 
     # Numeric labels above bars
     y_span = y_top - y_bottom
-    label_offset = 0.01 * y_span if y_span > 0 else 0.0
-    for bar, mean_val in zip(bars, means):
+    label_offset = 0.018 * y_span if y_span > 0 else 0.0
+    for bar, mean_val in zip(bars, provider_means):
         height = bar.get_height()
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -250,16 +305,23 @@ def plot_metric_bar_chart(pretty_names: List[str], means: List[float], metric: s
             f"{mean_val:.4f}",
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=FONTSIZE_BAR_LABELS,
         )
 
     ylabel, title = _metric_axis_label_and_title(metric)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=13, pad=15)
+    ax.set_ylabel(ylabel, fontsize=FONTSIZE_AXIS_LABELS)
+    # Title removed per user request
 
     ax.set_xticks(positions)
-    ax.set_xticklabels(pretty_names, rotation=45, ha="right", fontsize=9)
+    ax.set_xticklabels(provider_names, rotation=30, ha="right", fontsize=FONTSIZE_TICK_LABELS)
+    ax.tick_params(axis="y", labelsize=FONTSIZE_TICK_LABELS)
     ax.grid(True, alpha=0.3, axis="y")
+
+    # Add legend if we have baselines
+    if baseline_handles:
+        # Reverse handles to match visual order (lowest line at bottom of legend)
+        reversed_handles = list(reversed(baseline_handles))
+        ax.legend(handles=reversed_handles, loc="upper left", fontsize=FONTSIZE_LEGEND)
 
     fig.tight_layout()
     fig.savefig(output_file, dpi=150, bbox_inches="tight")
@@ -305,6 +367,16 @@ def main() -> None:
         if not file_keys:
             print(f"No valid scores for metric '{metric}', skipping.")
             continue
+
+        # Sort bars: margin and prob from low to high, exact_match from high to low
+        reverse_sort = metric == "exact_match"
+        sorted_data = sorted(zip(pretty_names, means, file_keys), key=lambda x: x[1], reverse=reverse_sort)
+        pretty_names, means, file_keys = zip(*sorted_data)
+        pretty_names = list(pretty_names)
+        means = list(means)
+        file_keys = list(file_keys)
+
+        # Generate graph
         output_file = f"combined_bar_{metric}.png"
         plot_metric_bar_chart(pretty_names, means, metric, output_file)
 
@@ -313,4 +385,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
