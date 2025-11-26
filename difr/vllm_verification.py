@@ -922,7 +922,7 @@ def verify_outputs(
     return all_token_metrics
 
 
-def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str]]:
+def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str], list[list[dict[str, str]]]]:
     tokenizer = AutoTokenizer.from_pretrained(cfg.trusted_model_name)
     tokenizer.padding_side = "left"
 
@@ -932,24 +932,50 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
 
     tokenized_prompts = []
     hf_prompts = []  # used because we need to add padding to prompts with hf
+    conversation_prompts = []
     unique_prompts = set()
+
+    system_prompt = []
 
     count = 0
     while len(tokenized_prompts) < cfg.n_samples:
-        raw_prompt = ds[count]["conversation"]
-        rendered_prompt = tokenizer.apply_chat_template(raw_prompt, tokenize=False, add_generation_prompt=True)
+        raw_prompt = ds[count]["conversation"]  # type: ignore[index]
+
+        # Check language before processing
+        if ds[count]["language"].lower() != "english":  # type: ignore[index]
+            count += 1
+            continue
+
+        count += 1
+
+        # Only include conversations that end with a user message
+        # If it ends with assistant, remove the last assistant message(s) to ensure
+        # the model has something to respond to
+        conversation = list(raw_prompt)  # Convert to list to allow modification
+        conversation = system_prompt + conversation
+        while conversation and conversation[-1].get("role") == "assistant":
+            conversation = conversation[:-1]
+
+        if "qwen" in cfg.trusted_model_name.lower():
+            conversation[-1]["content"] = conversation[-1]["content"] + "/nothink"
+
+        # Skip if conversation is empty or doesn't end with user
+        if not conversation or conversation[-1].get("role") != "user":
+            continue
+
+        rendered_prompt = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True)
         tokenized_prompt = tokenizer.encode(rendered_prompt, add_special_tokens=False, return_tensors=None)
         if len(tokenized_prompt) <= cfg.max_ctx_len:
             if tuple(tokenized_prompt) not in unique_prompts:
                 unique_prompts.add(tuple(tokenized_prompt))
                 tokenized_prompts.append(tokenized_prompt)
                 hf_prompts.append(rendered_prompt)
-        count += 1
+                conversation_prompts.append(conversation)
 
     # We haven't properly set the pad token yet so we need to delete the tokenizer
     del tokenizer
 
-    return tokenized_prompts, hf_prompts
+    return tokenized_prompts, hf_prompts, conversation_prompts
 
 
 def run(cfg: AttestationConfig) -> None:
@@ -967,7 +993,7 @@ def run(cfg: AttestationConfig) -> None:
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    tokenized_prompts, hf_prompts = construct_dataset(cfg)
+    tokenized_prompts, hf_prompts, conversation_prompts = construct_dataset(cfg)
 
     if cfg.untrusted_model_type == "hf":
         untrusted_outputs, vllm_metrics = generate_outputs_hf(cfg, hf_prompts, dtype)
