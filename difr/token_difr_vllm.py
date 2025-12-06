@@ -1,7 +1,7 @@
 import os
 
-# for activation hook
-os.environ["VLLM_USE_V1"] = "0"
+# Enable vLLM v1 features (prompt logprobs)
+os.environ["VLLM_USE_V1"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import json
@@ -9,7 +9,7 @@ import gc
 import pickle
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from datasets import load_dataset
@@ -206,6 +206,9 @@ def compute_margin_batch(
     top_p_vec: torch.Tensor,
     gold_idx_J: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    Compute max - gold margins for a batch where gold_idx_J indexes logits_JV.
+    """
     assert logits_JV.dim() == 2, f"Expected [J, V] logits, got {logits_JV.shape}"
     J, V = logits_JV.shape
 
@@ -271,6 +274,47 @@ def _as_list(x) -> list[int]:
     return list(x)
 
 
+def _prompt_logprobs_to_tensor(
+    prompt_logprobs: list[dict[int, Any] | None],
+    start_idx: int,
+    n_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a slice of prompt_logprobs into dense tensors.
+
+    Args:
+        prompt_logprobs: Full prompt_logprobs list from vLLM RequestOutput.
+        start_idx: Starting index (inclusive) of the slice to convert.
+        n_tokens: Number of tokens to convert starting at start_idx.
+        device: Target torch device.
+
+    Returns:
+        logits_JV: Tensor of shape [J, V'] with logprobs/logits.
+        token_ids_JV: Tensor of shape [J, V'] with token IDs.
+    """
+
+    slice_rows = prompt_logprobs[start_idx : start_idx + n_tokens]
+    if len(slice_rows) != n_tokens:
+        raise ValueError(f"Expected {n_tokens} prompt logprob rows, got {len(slice_rows)}")
+
+    max_k = max((len(row) if row is not None else 0) for row in slice_rows)
+    if max_k == 0:
+        raise ValueError("Prompt logprobs were empty; ensure prompt_logprobs > 0.")
+
+    logits = torch.full((n_tokens, max_k), float("-inf"), device=device)
+    token_ids = torch.full((n_tokens, max_k), -1, device=device, dtype=torch.long)
+
+    for j, row in enumerate(slice_rows):
+        if row is None:
+            continue
+        for col, (tok_id, lp) in enumerate(row.items()):
+            token_ids[j, col] = int(tok_id)
+            logits[j, col] = float(lp.logprob)
+
+    return logits, token_ids
+
+
 def generate_outputs_vllm(
     cfg: AttestationConfig,
     prompt_token_ids: list[list[int]],
@@ -296,7 +340,7 @@ def generate_outputs_vllm(
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=(cfg.max_ctx_len + cfg.max_decode_tokens) * 2,
         enforce_eager=True,
-        dtype=dtype,
+        dtype=dtype,  # type: ignore[arg-type]
         **vllm_args,
     )
 
@@ -309,7 +353,10 @@ def generate_outputs_vllm(
         seed=cfg.sampling_seed,  # This enables deterministic Gumbel-Max sampling
     )
 
-    outputs = model.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+    outputs = cast(
+        list[VllmStyleRequestOutput],
+        model.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params),
+    )
 
     del model
     torch.cuda.empty_cache()
@@ -329,13 +376,24 @@ def verify_outputs(
     Returns: list[list[TokenMetrics]]
     """
 
+    prompt_logprob_top_k = max(1, cfg.top_k)
+
     model = LLM(
         model=cfg.trusted_model_name,
         tensor_parallel_size=1,
         max_model_len=(cfg.max_ctx_len + cfg.max_decode_tokens) * 2,
         enforce_eager=True,
-        dtype=dtype,
+        dtype=dtype,  # type: ignore[arg-type]
         gpu_memory_utilization=0.7,
+        logprobs_mode="raw_logits",
+        max_logprobs=max(prompt_logprob_top_k, 64),
+    )
+
+    prompt_logprob_params = SamplingParams(
+        prompt_logprobs=prompt_logprob_top_k,
+        max_tokens=1,
+        logprobs=0,
+        detokenize=False,
     )
 
     device_for_inputs = torch.device("cuda")
@@ -344,8 +402,6 @@ def verify_outputs(
 
     # Create per-request generator for verification
     generator = torch.Generator(device=device_for_inputs)
-
-    lm_head_DV = model.llm_engine.model_executor.driver_worker.model_runner.model.lm_head.weight.T
 
     # Batch work across generated tokens per request for speed.
     for i in tqdm(range(0, len(outputs)), desc="Verifying outputs"):
@@ -356,99 +412,67 @@ def verify_outputs(
         gen_only: list[int] = _as_list(req.outputs[0].token_ids)
         seq_concat: list[int] = prompt_token_ids + gen_ids
 
-        acts_LD = None
-
-        def activation_saving_hook(module, input, output):
-            nonlocal acts_LD
-            acts_LD = input[1]
-
-        logits_processor = model.llm_engine.model_executor.driver_worker.model_runner.model.logits_processor
-        saved_acts_handle = logits_processor.register_forward_hook(activation_saving_hook)
-
-        fake_sampling_params = SamplingParams(
-            temperature=1.0,
-            max_tokens=1,
-        )
-
-        _ = model.generate(prompt_token_ids=seq_concat, sampling_params=fake_sampling_params, use_tqdm=False)
-        saved_acts_handle.remove()
-
-        logits_LV = acts_LD @ lm_head_DV
-
-        assert acts_LD is not None
-        assert acts_LD.shape[:-1] == logits_LV.shape[:-1], (
-            f"acts_LD.shape: {acts_LD.shape}, logits_LV.shape: {logits_LV.shape}"
-        )
-        assert acts_LD.shape[-1] < logits_LV.shape[-1], (
-            f"acts_LD.shape[-1]: {acts_LD.shape[-1]}, logits_LV.shape[-1]: {logits_LV.shape[-1]}"
-        )
-
-        # We only need float math for filtering and CDFs
-        logits_LV = logits_LV.float()
-
-        # Convert top_k and top_p to tensors for get_probs
-        L = logits_LV.size(0)
-        top_k_tensor = torch.full((L,), cfg.top_k, device=logits_LV.device, dtype=torch.long)
-        top_p_tensor = torch.full((L,), cfg.verification_top_p, device=logits_LV.device, dtype=logits_LV.dtype)
-        probs_LV = get_probs(logits_LV, cfg.verification_temperature, top_k_tensor, top_p_tensor)
-
         prompt_len = len(prompt_token_ids)
         gen_len = len(gen_ids)
 
-        # Positions that produced each generated token
-        start_pos = prompt_len - 1
-        pos_idx_J = torch.arange(start_pos, start_pos + gen_len, device=logits_LV.device)
-
-        # Slice all needed rows once
-        logits_JV = logits_LV.index_select(0, pos_idx_J)  # [J, V]
-        probs_JV = probs_LV.index_select(0, pos_idx_J)  # [J, V]
-
-        # Gold indices per position (the actual generated tokens)
-        gold_idx_J = torch.as_tensor(gen_only, device=logits_LV.device, dtype=torch.long)
-
-        # Build per-row k/p for masking
-        J = logits_JV.shape[0]
-
-        if J == 0:
-            # raise ValueError("No generated tokens in sequence")
+        if gen_len == 0:
             continue
 
-        k_vec = torch.as_tensor([cfg.top_k], device=logits_LV.device, dtype=torch.long).expand(J)
-        p_vec = torch.as_tensor([cfg.verification_top_p], device=logits_LV.device, dtype=probs_JV.dtype).expand(J)
+        verify_req = model.generate(
+            prompt_token_ids=seq_concat,
+            sampling_params=prompt_logprob_params,
+            use_tqdm=False,
+        )[0]
 
-        # Sample all Exponential(1) noises with consistent generator usage
+        if verify_req.prompt_logprobs is None:
+            raise ValueError("vLLM did not return prompt_logprobs; enable prompt_logprobs in SamplingParams.")
+
+        logits_JV, token_ids_JV = _prompt_logprobs_to_tensor(
+            verify_req.prompt_logprobs,
+            start_idx=prompt_len,
+            n_tokens=gen_len,
+            device=device_for_inputs,
+        )
+
+        J = logits_JV.shape[0]
+        gold_token_ids = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
+
+        matches = token_ids_JV == gold_token_ids.unsqueeze(1)
+        if not matches.any(dim=1).all():
+            raise ValueError("Gold token missing from returned prompt_logprobs.")
+        gold_col_idx = matches.float().argmax(dim=1).long()
+
+        top_k_tensor = torch.full((J,), logits_JV.shape[1], device=logits_JV.device, dtype=torch.long)
+        top_p_tensor = torch.full((J,), cfg.verification_top_p, device=logits_JV.device, dtype=logits_JV.dtype)
+
+        logits_JV = logits_JV.float()
+        probs_JV = get_probs(logits_JV, cfg.verification_temperature, top_k_tensor, top_p_tensor)
+
         generator.manual_seed(cfg.verification_seed)
-        exponential_rows = []
-        for _ in range(J):
-            exp_v = torch.empty_like(probs_JV[0])
-            exp_v.exponential_(generator=generator)
-            exponential_rows.append(exp_v)
-        random_exponentials_JV = torch.stack(exponential_rows, dim=0)
+        random_exponentials_JV = torch.empty_like(probs_JV)
+        random_exponentials_JV.exponential_(generator=generator)
 
-        # Predicted IDs via Gumbel-Max (p_i / e_i)
         gumbel_max_scores_JV = probs_JV / random_exponentials_JV
-        pred_ids_J = gumbel_max_scores_JV.argmax(dim=-1)
+        pred_cols_J = gumbel_max_scores_JV.argmax(dim=-1)
+        pred_ids_J = token_ids_JV[torch.arange(J, device=device_for_inputs), pred_cols_J]
 
-        # Pairwise Gumbel scores for each sigma (batched)
         margins_J = compute_margin_batch(
             logits_JV.clone(),
             random_exponentials_JV,
             temperature=cfg.verification_temperature,
-            top_k_vec=k_vec,
-            top_p_vec=p_vec,
-            gold_idx_J=gold_idx_J,
+            top_k_vec=top_k_tensor,
+            top_p_vec=top_p_tensor,
+            gold_idx_J=gold_col_idx,
         )
 
-        # Per-token probabilities for the actually generated token
-        probs_gold_J = probs_JV.gather(1, gold_idx_J.view(-1, 1)).squeeze(1)
+        probs_gold_J = probs_JV.gather(1, gold_col_idx.view(-1, 1)).squeeze(1)
 
-        # Package per-token metrics
         seq_token_metrics: list[SimpleTokenMetrics] = []
         for j in range(J):
-            actual_id = int(gen_only[j]) if not isinstance(gen_only[j], torch.Tensor) else int(gen_only[j].item())
+            actual_id = int(gen_only[j])
 
             token_metrics = SimpleTokenMetrics(
-                exact_match=bool(pred_ids_J[j].item() == actual_id),
+                exact_match=bool(int(pred_ids_J[j]) == actual_id),
                 prob=float(probs_gold_J[j].item()),
                 margin=float(margins_J[j].item()),
             )
