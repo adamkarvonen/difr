@@ -46,6 +46,16 @@ class SimpleTokenMetrics:
     exact_match: bool
     prob: float
     margin: float
+    logit_rank: float = float("inf")
+    gumbel_rank: float = float("inf")
+
+    # Allow reading older pickles without the rank fields.
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if "logit_rank" not in self.__dict__:
+            self.logit_rank = float("inf")
+        if "gumbel_rank" not in self.__dict__:
+            self.gumbel_rank = float("inf")
 
 
 def is_local_baseline(file_name: str) -> bool:

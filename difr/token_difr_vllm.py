@@ -264,6 +264,8 @@ class SimpleTokenMetrics:
     exact_match: bool
     prob: float
     margin: float
+    logit_rank: float
+    gumbel_rank: float
 
 
 def _as_list(x) -> list[int]:
@@ -448,6 +450,15 @@ def verify_outputs(
         logits_JV = logits_JV.float()
         probs_JV = get_probs(logits_JV, cfg.verification_temperature, top_k_tensor, top_p_tensor)
 
+        # Rank of the gold token in the raw logits (0 = highest logit).
+        row_idx_J = torch.arange(J, device=device_for_inputs)
+        gold_logits_J = logits_JV[row_idx_J, gold_col_idx]
+        logit_ranks_J = (logits_JV > gold_logits_J.unsqueeze(1)).sum(dim=1).float()
+
+        # Track whether the gold token was removed by top-k/top-p filtering.
+        filtered_logits_JV = apply_top_k_top_p(logits_JV.clone(), top_k_tensor, top_p_tensor)
+        gold_filtered_J = ~torch.isfinite(filtered_logits_JV[row_idx_J, gold_col_idx])
+
         generator.manual_seed(cfg.verification_seed)
         random_exponentials_JV = torch.empty_like(probs_JV)
         random_exponentials_JV.exponential_(generator=generator)
@@ -455,6 +466,16 @@ def verify_outputs(
         gumbel_max_scores_JV = probs_JV / random_exponentials_JV
         pred_cols_J = gumbel_max_scores_JV.argmax(dim=-1)
         pred_ids_J = token_ids_JV[torch.arange(J, device=device_for_inputs), pred_cols_J]
+
+        # Rank of the gold token in the Gumbel-Max scores (0 = highest score).
+        gold_gumbel_scores_J = gumbel_max_scores_JV[row_idx_J, gold_col_idx]
+        gumbel_ranks_J = torch.full((J,), float("inf"), device=device_for_inputs)
+        valid_mask_J = ~gold_filtered_J
+        if valid_mask_J.any():
+            higher_scores_counts = (
+                gumbel_max_scores_JV[valid_mask_J] > gold_gumbel_scores_J[valid_mask_J].unsqueeze(1)
+            ).sum(dim=1)
+            gumbel_ranks_J[valid_mask_J] = higher_scores_counts.float()
 
         margins_J = compute_margin_batch(
             logits_JV.clone(),
@@ -475,6 +496,8 @@ def verify_outputs(
                 exact_match=bool(int(pred_ids_J[j]) == actual_id),
                 prob=float(probs_gold_J[j].item()),
                 margin=float(margins_J[j].item()),
+                logit_rank=float(logit_ranks_J[j].item()),
+                gumbel_rank=float(gumbel_ranks_J[j].item()),
             )
             seq_token_metrics.append(token_metrics)
 
