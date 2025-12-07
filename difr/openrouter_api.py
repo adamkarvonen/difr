@@ -83,28 +83,32 @@ def save_results(
     model_name: str,
     max_completion_tokens: int,
 ) -> None:
-    """Save samples as JSON in VLLM-style format with tokenized prompts and responses."""
+    """Save samples as JSON with tokenized prompts and responses."""
     # Load tokenizer for the model
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Tokenize prompts and responses
-    vllm_samples = []
+    token_samples = []
     for prompt, response in tqdm(samples, desc="Tokenizing samples"):
         # Tokenize prompt (conversation array)
         rendered_prompt = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
         prompt_token_ids = tokenizer.encode(rendered_prompt, add_special_tokens=False, return_tensors=None)
 
         # Tokenize response (plain string)
-        response_token_ids = tokenizer.encode(response, add_special_tokens=False, return_tensors=None)
-        response_token_ids = response_token_ids[:max_completion_tokens]
+        output_token_ids = tokenizer.encode(response, add_special_tokens=False, return_tensors=None)
+        output_token_ids = output_token_ids[:max_completion_tokens]
 
-        # Create VLLM-style sample
-        vllm_samples.append({"prompt_token_ids": prompt_token_ids, "outputs": [{"token_ids": response_token_ids}]})
+        token_samples.append(
+            {
+                "prompt_token_ids": prompt_token_ids,
+                "output_token_ids": output_token_ids,
+            }
+        )
 
     del tokenizer
 
     # Save as JSON
-    payload = {"config": config, "samples": vllm_samples}
+    payload = {"config": config, "samples": token_samples}
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(payload, f)
     print(f"Saved {len(samples)} samples to {save_path}")
@@ -112,13 +116,14 @@ def save_results(
 
 async def main():
     model_name = "meta-llama/llama-3.1-8b-instruct"
-    max_completion_tokens = 500
+    max_completion_tokens = 300
     temperature = 0.0
     concurrency = 50
 
-    for provider in ["cerebras", "hyperbolic", "groq", "siliconflow/fp8", "deepinfra"]:
+    # for provider in ["cerebras", "hyperbolic", "groq", "siliconflow/fp8", "deepinfra"]:
+    for provider in ["groq"]:
         save_dir = Path("openrouter_responses")
-        n_samples = 2000
+        n_samples = 300
         max_ctx_len = 512
 
         # Load OpenRouter API key from file to keep the script simple.
@@ -147,7 +152,7 @@ async def main():
 
         save_dir.mkdir(parents=True, exist_ok=True)
         model_tag = _sanitize(f"{provider}_{model_name}")
-        save_filename = f"openrouter_{model_tag}_token_difr_prompts_test.json"
+        save_filename = f"openrouter_{model_tag}_token_difr_prompts.json"
         config = {
             "model": model_name,
             "provider": provider,

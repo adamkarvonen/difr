@@ -4,12 +4,11 @@ import os
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-import json
 import gc
-import pickle
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import torch
 from datasets import load_dataset
@@ -18,6 +17,7 @@ from transformers import (
     AutoTokenizer,
 )
 from vllm import LLM, SamplingParams
+from vllm.inputs import TokensPrompt
 
 
 @dataclass
@@ -45,7 +45,7 @@ class AttestationConfig:
     external_prompt_filename: str | None = None
 
     save_dir: str = "token_difr_attestation_results"
-    save_filename: str = "attestation_results.pkl"
+    save_filename: str = "attestation_results.json"
 
 
 def exponential_to_gumbel(random_exponentials: torch.Tensor, epsilon: float) -> torch.Tensor:
@@ -239,24 +239,11 @@ def compute_margin_batch(
 
 
 @dataclass
-class CompletionOutput:
-    """
-    Represents a single generated completion for a prompt.
-    The structure req.outputs[0] in your example.
-    """
-
-    token_ids: list[int]
-
-
-@dataclass
-class VllmStyleRequestOutput:
-    """
-    Represents the full input and output for a single request.
-    This is the 'req' object in your example.
-    """
+class TokenSequence:
+    """A prompt and its generated output as token IDs."""
 
     prompt_token_ids: list[int]
-    outputs: list[CompletionOutput]
+    output_token_ids: list[int]
 
 
 @dataclass
@@ -281,47 +268,47 @@ def _prompt_logprobs_to_tensor(
     start_idx: int,
     n_tokens: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    vocab_size: int,
+) -> torch.Tensor:
     """
-    Convert a slice of prompt_logprobs into dense tensors.
+    Convert a slice of prompt_logprobs into a dense full-vocabulary tensor.
 
     Args:
         prompt_logprobs: Full prompt_logprobs list from vLLM RequestOutput.
         start_idx: Starting index (inclusive) of the slice to convert.
         n_tokens: Number of tokens to convert starting at start_idx.
         device: Target torch device.
+        vocab_size: Full vocabulary size. Positions not in top-k are set to -inf.
 
     Returns:
-        logits_JV: Tensor of shape [J, V'] with logprobs/logits.
-        token_ids_JV: Tensor of shape [J, V'] with token IDs.
+        logits_JV: Tensor of shape [J, vocab_size] with logprobs/logits.
     """
 
     slice_rows = prompt_logprobs[start_idx : start_idx + n_tokens]
     if len(slice_rows) != n_tokens:
         raise ValueError(f"Expected {n_tokens} prompt logprob rows, got {len(slice_rows)}")
 
-    max_k = max((len(row) if row is not None else 0) for row in slice_rows)
-    if max_k == 0:
-        raise ValueError("Prompt logprobs were empty; ensure prompt_logprobs > 0.")
-
-    logits = torch.full((n_tokens, max_k), float("-inf"), device=device)
-    token_ids = torch.full((n_tokens, max_k), -1, device=device, dtype=torch.long)
+    # Initialize full vocab tensor with -inf
+    logits = torch.full((n_tokens, vocab_size), float("-inf"), device=device)
 
     for j, row in enumerate(slice_rows):
-        if row is None:
+        if not row:
             continue
-        for col, (tok_id, lp) in enumerate(row.items()):
-            token_ids[j, col] = int(tok_id)
-            logits[j, col] = float(lp.logprob)
 
-    return logits, token_ids
+        token_ids = torch.tensor([int(tok_id) for tok_id in row.keys()], device=device, dtype=torch.long)
+        logprobs = torch.tensor([float(val.logprob) for val in row.values()], device=device)
+
+        # Scatter logprobs into the correct positions
+        logits[j].scatter_(0, token_ids, logprobs)
+
+    return logits
 
 
 def generate_outputs_vllm(
     cfg: AttestationConfig,
     prompt_token_ids: list[list[int]],
     dtype: torch.dtype,
-) -> list[VllmStyleRequestOutput]:
+) -> list[TokenSequence]:
     vllm_args = dict(cfg.vllm_args)
 
     requested_tensor_parallel = vllm_args.pop("tensor_parallel_size", None)
@@ -355,10 +342,18 @@ def generate_outputs_vllm(
         seed=cfg.sampling_seed,  # This enables deterministic Gumbel-Max sampling
     )
 
-    outputs = cast(
-        list[VllmStyleRequestOutput],
-        model.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params),
-    )
+    token_prompts: list[TokensPrompt] = [{"prompt_token_ids": ids} for ids in prompt_token_ids]
+
+    vllm_outputs = model.generate(token_prompts, sampling_params=sampling_params)
+
+    # Convert vLLM outputs to TokenSequence
+    outputs = [
+        TokenSequence(
+            prompt_token_ids=_as_list(req.prompt_token_ids),
+            output_token_ids=_as_list(req.outputs[0].token_ids),
+        )
+        for req in vllm_outputs
+    ]
 
     del model
     torch.cuda.empty_cache()
@@ -368,7 +363,7 @@ def generate_outputs_vllm(
 
 @torch.inference_mode()
 def verify_outputs(
-    outputs: list[VllmStyleRequestOutput],
+    outputs: list[TokenSequence],
     cfg: AttestationConfig,
     dtype: torch.dtype,
 ) -> list[list[SimpleTokenMetrics]]:
@@ -378,8 +373,6 @@ def verify_outputs(
     Returns: list[list[TokenMetrics]]
     """
 
-    prompt_logprob_top_k = max(1, cfg.top_k)
-
     model = LLM(
         model=cfg.trusted_model_name,
         tensor_parallel_size=1,
@@ -388,11 +381,15 @@ def verify_outputs(
         dtype=dtype,  # type: ignore[arg-type]
         gpu_memory_utilization=0.7,
         logprobs_mode="raw_logits",
-        max_logprobs=max(prompt_logprob_top_k, 64),
+        max_logprobs=cfg.top_k,
     )
 
+    # Get vocab size from the model's tokenizer (use len() to include added tokens)
+    tokenizer = model.get_tokenizer()
+    vocab_size = len(tokenizer)
+
     prompt_logprob_params = SamplingParams(
-        prompt_logprobs=prompt_logprob_top_k,
+        prompt_logprobs=cfg.top_k,
         max_tokens=1,
         logprobs=0,
         detokenize=False,
@@ -410,8 +407,8 @@ def verify_outputs(
         req = outputs[i]
 
         prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
-        gen_ids: list[int] = _as_list(req.outputs[0].token_ids)
-        gen_only: list[int] = _as_list(req.outputs[0].token_ids)
+        gen_ids: list[int] = _as_list(req.output_token_ids)
+        gen_only: list[int] = _as_list(req.output_token_ids)
         seq_concat: list[int] = prompt_token_ids + gen_ids
 
         prompt_len = len(prompt_token_ids)
@@ -420,31 +417,25 @@ def verify_outputs(
         if gen_len == 0:
             continue
 
-        verify_req = model.generate(
-            prompt_token_ids=seq_concat,
-            sampling_params=prompt_logprob_params,
-            use_tqdm=False,
-        )[0]
+        verify_prompts: list[TokensPrompt] = [{"prompt_token_ids": seq_concat}]
+        verify_req = model.generate(verify_prompts, sampling_params=prompt_logprob_params, use_tqdm=False)[0]
 
         if verify_req.prompt_logprobs is None:
             raise ValueError("vLLM did not return prompt_logprobs; enable prompt_logprobs in SamplingParams.")
 
-        logits_JV, token_ids_JV = _prompt_logprobs_to_tensor(
+        logits_JV = _prompt_logprobs_to_tensor(
             verify_req.prompt_logprobs,
             start_idx=prompt_len,
             n_tokens=gen_len,
             device=device_for_inputs,
+            vocab_size=vocab_size,
         )
 
         J = logits_JV.shape[0]
-        gold_token_ids = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
+        # With full vocab tensor, token ID is the column index
+        gold_col_idx = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
 
-        matches = token_ids_JV == gold_token_ids.unsqueeze(1)
-        if not matches.any(dim=1).all():
-            raise ValueError("Gold token missing from returned prompt_logprobs.")
-        gold_col_idx = matches.float().argmax(dim=1).long()
-
-        top_k_tensor = torch.full((J,), logits_JV.shape[1], device=logits_JV.device, dtype=torch.long)
+        top_k_tensor = torch.full((J,), cfg.top_k, device=logits_JV.device, dtype=torch.long)
         top_p_tensor = torch.full((J,), cfg.verification_top_p, device=logits_JV.device, dtype=logits_JV.dtype)
 
         logits_JV = logits_JV.float()
@@ -459,13 +450,19 @@ def verify_outputs(
         filtered_logits_JV = apply_top_k_top_p(logits_JV.clone(), top_k_tensor, top_p_tensor)
         gold_filtered_J = ~torch.isfinite(filtered_logits_JV[row_idx_J, gold_col_idx])
 
+        # Sample all Exponential(1) noises with consistent generator usage
+        # Must be done row-by-row to match vLLM's token-by-token RNG order
         generator.manual_seed(cfg.verification_seed)
-        random_exponentials_JV = torch.empty_like(probs_JV)
-        random_exponentials_JV.exponential_(generator=generator)
+        exponential_rows = []
+        for _ in range(J):
+            exp_v = torch.empty_like(probs_JV[0])
+            exp_v.exponential_(generator=generator)
+            exponential_rows.append(exp_v)
+        random_exponentials_JV = torch.stack(exponential_rows, dim=0)
 
         gumbel_max_scores_JV = probs_JV / random_exponentials_JV
-        pred_cols_J = gumbel_max_scores_JV.argmax(dim=-1)
-        pred_ids_J = token_ids_JV[torch.arange(J, device=device_for_inputs), pred_cols_J]
+        # With full vocab, column index is the token ID
+        pred_ids_J = gumbel_max_scores_JV.argmax(dim=-1)
 
         # Rank of the gold token in the Gumbel-Max scores (0 = highest score).
         gold_gumbel_scores_J = gumbel_max_scores_JV[row_idx_J, gold_col_idx]
@@ -562,63 +559,52 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
     return tokenized_prompts, hf_prompts, conversation_prompts
 
 
-def load_external_tokens(data_path: str) -> list[VllmStyleRequestOutput]:
-    """Load external tokenized data from JSON file in VLLM-style format.
+def load_external_tokens(data_path: str) -> list[TokenSequence]:
+    """Load external tokenized data from JSON file.
 
-    Expected JSON format:
-    {
-        "config": {
-            "model": str,
-            "temperature": float,
-            ...
-        },
-        "samples": [
-            {
-                "prompt_token_ids": list[int],
-                "outputs": [
-                    {
-                        "token_ids": list[int]
-                    }
-                ]
-            },
-            ...
-        ]
-    }
+    Supports two formats:
+    1. New format with output_token_ids:
+        {"samples": [{"prompt_token_ids": [...], "output_token_ids": [...]}, ...]}
+
+    2. Legacy format with nested outputs:
+        {"samples": [{"prompt_token_ids": [...], "outputs": [{"token_ids": [...]}]}, ...]}
 
     Args:
         data_path: Path to the JSON file containing tokenized data
 
     Returns:
-        List of VllmStyleRequestOutput objects with prompt_token_ids and outputs
+        List of TokenSequence objects
     """
-    # Load the JSON file
     with open(data_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Verify config exists
-    assert "config" in data, "Config not found in data"
     assert "samples" in data, "Samples not found in data"
 
-    # Convert JSON samples to VllmStyleRequestOutput objects
-    vllm_style_outputs = []
+    outputs = []
     for sample in data["samples"]:
         assert "prompt_token_ids" in sample, "prompt_token_ids not found in sample"
-        assert "outputs" in sample, "outputs not found in sample"
-        assert "token_ids" in sample["outputs"][0], "token_ids not found in output"
 
-        vllm_style_outputs.append(
-            VllmStyleRequestOutput(
+        # Support both new format (output_token_ids) and legacy format (outputs[0].token_ids)
+        if "output_token_ids" in sample:
+            output_ids = sample["output_token_ids"]
+        elif "outputs" in sample:
+            output_ids = sample["outputs"][0]["token_ids"]
+        else:
+            raise ValueError("Sample must have either 'output_token_ids' or 'outputs'")
+
+        outputs.append(
+            TokenSequence(
                 prompt_token_ids=sample["prompt_token_ids"],
-                outputs=[CompletionOutput(token_ids=output["token_ids"]) for output in sample["outputs"]],
+                output_token_ids=output_ids,
             )
         )
 
-    return vllm_style_outputs
+    return outputs
 
 
 def run(
     cfg: AttestationConfig,
-    external_responses: list[VllmStyleRequestOutput] | None = None,
+    external_responses: list[TokenSequence] | None = None,
 ) -> None:
     dtype = torch.bfloat16
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
@@ -646,10 +632,13 @@ def run(
 
     verifier_scores = verify_outputs(untrusted_outputs, cfg, dtype)
 
-    with open(save_path, "wb") as f:
-        pickle.dump(
+    # Convert dataclasses to dicts for JSON serialization
+    scores_as_dicts = [[asdict(token) for token in seq] for seq in verifier_scores]
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(
             {
-                "scores": verifier_scores,
+                "scores": scores_as_dicts,
                 "config": asdict(cfg),
             },
             f,
@@ -665,112 +654,111 @@ if __name__ == "__main__":
     # 1. Correct configuration (baseline)
     cfgs.append(
         AttestationConfig(
-            save_filename=f"verification_{model_name_str}_vllm_bf16.pkl",
+            save_filename=f"verification_{model_name_str}_vllm_bf16.json",
             trusted_model_name=model_name,
         )
     )
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{model_name_str}_vllm_fp8.pkl",
-            trusted_model_name=model_name,
-            vllm_args={"quantization": "fp8"},
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{model_name_str}_vllm_fp8.json",
+    #         trusted_model_name=model_name,
+    #         vllm_args={"quantization": "fp8"},
+    #     )
+    # )
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{model_name_str}_vllm_4bit.pkl",
-            trusted_model_name=model_name,
-            vllm_args={"quantization": "bitsandbytes"},
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{model_name_str}_vllm_4bit.json",
+    #         trusted_model_name=model_name,
+    #         vllm_args={"quantization": "bitsandbytes"},
+    #     )
+    # )
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{model_name_str}_vllm_fp8_kv.pkl",
-            trusted_model_name=model_name,
-            vllm_args={"kv_cache_dtype": "fp8", "calculate_kv_scales": True},
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{model_name_str}_vllm_fp8_kv.json",
+    #         trusted_model_name=model_name,
+    #         vllm_args={"kv_cache_dtype": "fp8", "calculate_kv_scales": True},
+    #     )
+    # )
 
     external_prompt_filename = (
-        "openrouter_responses/openrouter_groq_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
+        "openrouter_responses/openrouter_groq_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
     )
 
     external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
     cfgs.append(
         AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.pkl",
+            save_filename=f"verification_{external_save_filename}.json",
             trusted_model_name=model_name,
             external_prompt_filename=external_prompt_filename,
         )
     )
 
-    external_prompt_filename = (
-        "openrouter_responses/openrouter_hyperbolic_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
-    )
+    # external_prompt_filename = (
+    #     "openrouter_responses/openrouter_hyperbolic_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
+    # )
 
-    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+    # external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.pkl",
-            trusted_model_name=model_name,
-            external_prompt_filename=external_prompt_filename,
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{external_save_filename}.json",
+    #         trusted_model_name=model_name,
+    #         external_prompt_filename=external_prompt_filename,
+    #     )
+    # )
 
-    external_prompt_filename = (
-        "openrouter_responses/openrouter_siliconflow_fp8_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
-    )
+    # external_prompt_filename = (
+    #     "openrouter_responses/"
+    #     "openrouter_siliconflow_fp8_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
+    # )
 
-    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+    # external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.pkl",
-            trusted_model_name=model_name,
-            external_prompt_filename=external_prompt_filename,
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{external_save_filename}.json",
+    #         trusted_model_name=model_name,
+    #         external_prompt_filename=external_prompt_filename,
+    #     )
+    # )
 
-    external_prompt_filename = (
-        "openrouter_responses/openrouter_cerebras_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
-    )
+    # external_prompt_filename = (
+    #     "openrouter_responses/openrouter_cerebras_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
+    # )
 
-    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+    # external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.pkl",
-            trusted_model_name=model_name,
-            external_prompt_filename=external_prompt_filename,
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{external_save_filename}.json",
+    #         trusted_model_name=model_name,
+    #         external_prompt_filename=external_prompt_filename,
+    #     )
+    # )
 
-    external_prompt_filename = (
-        "openrouter_responses/openrouter_deepinfra_meta-llama_llama-3_1-8b-instruct_token_difr_prompts_test.json"
-    )
+    # external_prompt_filename = (
+    #     "openrouter_responses/openrouter_deepinfra_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
+    # )
 
-    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+    # external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.pkl",
-            trusted_model_name=model_name,
-            external_prompt_filename=external_prompt_filename,
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{external_save_filename}.json",
+    #         trusted_model_name=model_name,
+    #         external_prompt_filename=external_prompt_filename,
+    #     )
+    # )
 
     # Apply smoketest settings to all configs
     filenames = []
     for i in range(len(cfgs)):
-        cfgs[i].n_samples = 2000
-        cfgs[i].max_decode_tokens = 500
-        cfgs[i].sampling_temperature = 0.0
-        cfgs[i].verification_temperature = 0.0
+        cfgs[i].n_samples = 200
+        cfgs[i].max_decode_tokens = 200
         cfgs[i].save_dir = "token_difr_results"
         filenames.append(cfgs[i].save_filename)
 
@@ -791,5 +779,5 @@ if __name__ == "__main__":
             external_responses = load_external_tokens(cfg.external_prompt_filename)
 
         run(cfg, external_responses)
-        print(f"✓ Complete: {cfg.save_filename}")
+        print(f"Complete: {cfg.save_filename}")
         print()

@@ -3,7 +3,7 @@
 Create simple bar charts over all token DIFR result files.
 
 For each metric (margin, prob, exact_match) this script:
-  - Loads every pickle in RESULTS_DIR
+  - Loads every JSON file in RESULTS_DIR
   - Computes the mean token-level score per file
   - Draws a single bar chart with sane, auto-chosen y-limits
 
@@ -14,20 +14,22 @@ manually positioning text below/above the axis.
 
 from __future__ import annotations
 
+import json
 import math
-import pickle
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+from token_difr_vllm import SimpleTokenMetrics
 
 # ============================================================================
 # Configuration constants
 # ============================================================================
 RESULTS_DIR = "token_difr_results"
-TRUSTED_FILENAME = f"{RESULTS_DIR}/verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.pkl"
+TRUSTED_FILENAME = f"{RESULTS_DIR}/verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.json"
+# TRUSTED_FILENAME = f"{RESULTS_DIR}/verification_openai_gpt-oss-20b_vllm_bf16.json"
 
 # Text size constants
 FONTSIZE_BAR_LABELS = 12  # Numbers above bars
@@ -41,21 +43,19 @@ MARGIN_PERCENTILE_99_9: float | None = None
 PROB_PERCENTILE_99_9: float | None = None
 
 
-@dataclass
-class SimpleTokenMetrics:
-    exact_match: bool
-    prob: float
-    margin: float
-    logit_rank: float = float("inf")
-    gumbel_rank: float = float("inf")
+def load_results(file_path: str) -> Dict[str, Any]:
+    """Load results from JSON and convert score dicts to SimpleTokenMetrics."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-    # Allow reading older pickles without the rank fields.
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if "logit_rank" not in self.__dict__:
-            self.logit_rank = float("inf")
-        if "gumbel_rank" not in self.__dict__:
-            self.gumbel_rank = float("inf")
+    # Convert score dicts to SimpleTokenMetrics dataclasses
+    if "scores" in data:
+        data["scores"] = [
+            [SimpleTokenMetrics(**token_dict) for token_dict in seq]
+            for seq in data["scores"]
+        ]
+
+    return data
 
 
 def is_local_baseline(file_name: str) -> bool:
@@ -66,7 +66,7 @@ def is_local_baseline(file_name: str) -> bool:
 
 def get_pretty_name(file_name: str) -> str:
     """Convert file name to a prettier display name for legends and labels."""
-    name = file_name.replace(".pkl", "")
+    name = file_name.replace(".json", "").replace(".pkl", "")
 
     # Handle OpenRouter files with providers
     lower_name = name.lower()
@@ -105,8 +105,7 @@ def calculate_percentile_thresholds(trusted_file: str) -> Tuple[float, float]:
         return MARGIN_PERCENTILE_99_9, PROB_PERCENTILE_99_9
 
     print(f"Loading trusted file to calculate percentiles: {trusted_file}")
-    with open(trusted_file, "rb") as f:
-        trusted_data = pickle.load(f)
+    trusted_data = load_results(trusted_file)
 
     if "scores" not in trusted_data:
         raise ValueError(f"Trusted file does not contain 'scores' key. Available keys: {list(trusted_data.keys())}")
@@ -139,7 +138,7 @@ def calculate_percentile_thresholds(trusted_file: str) -> Tuple[float, float]:
 
 
 def extract_all_scores(data: Dict, metric: str) -> List[float]:
-    """Extract all token-level scores from loaded pickle data."""
+    """Extract all token-level scores from loaded results data."""
     if "scores" not in data:
         raise ValueError(f"Data does not contain 'scores' key. Available keys: {list(data.keys())}")
 
@@ -350,24 +349,23 @@ def main() -> None:
         print(f"Error: Directory not found: {RESULTS_DIR}")
         return
 
-    pickle_files = sorted(results_path.glob("*.pkl"))
-    if not pickle_files:
-        print(f"No pickle files found in {RESULTS_DIR}")
+    json_files = sorted(results_path.glob("*.json"))
+    if not json_files:
+        print(f"No JSON files found in {RESULTS_DIR}")
         return
 
-    print(f"Found {len(pickle_files)} pickle files")
+    print(f"Found {len(json_files)} JSON files")
     print("=" * 70)
 
     all_data: Dict[str, Dict] = {}
-    for pickle_file in pickle_files:
-        print(f"Loading {pickle_file.name}...")
+    for json_file in json_files:
+        print(f"Loading {json_file.name}...")
         try:
-            with open(pickle_file, "rb") as f:
-                data = pickle.load(f)
+            data = load_results(str(json_file))
         except Exception as exc:  # noqa: BLE001
-            print(f"Error loading {pickle_file}: {exc}")
+            print(f"Error loading {json_file}: {exc}")
             continue
-        all_data[str(pickle_file)] = data
+        all_data[str(json_file)] = data
 
     print("=" * 70)
 

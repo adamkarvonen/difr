@@ -1,54 +1,38 @@
 # %%
 # %%
 
-import pickle
+import json
+import math
 import os
+import warnings
+from typing import Any
+
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import roc_curve, auc
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from dataclasses import dataclass
-import warnings
-import itertools
-import math
 from matplotlib.ticker import ScalarFormatter
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import auc, roc_curve
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+from token_difr_vllm import SimpleTokenMetrics
 
 warnings.filterwarnings("ignore")
 
 
-@dataclass
-class TokenMetrics:
-    toploc_metrics: tuple[int, float, float]
-    denominator_distance: float
-    mean_act_distance: float
-    mean_logit_distance: float
-    exact_match: bool
-    prob: float
-    sampler_scores: dict[float, float]
-    mc_scores: dict[float, float]
-    down_proj_distances: dict[int, float]
-    fast_gaussian_scores: dict[float, float]
-    gumbel_max_score: float
-    pairwise_gumbel_scores: dict[float, float]
+def load_results(file_path: str) -> dict[str, Any]:
+    """Load results from JSON and convert score dicts to SimpleTokenMetrics."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
+    # Convert score dicts to SimpleTokenMetrics dataclasses
+    if "scores" in data:
+        data["scores"] = [
+            [SimpleTokenMetrics(**token_dict) for token_dict in seq]
+            for seq in data["scores"]
+        ]
 
-@dataclass
-class SimpleTokenMetrics:
-    exact_match: bool
-    prob: float
-    margin: float
-    logit_rank: float = float("inf")
-    gumbel_rank: float = float("inf")
-
-    # Allow backward compatibility when loading pickles without ranks.
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        if "logit_rank" not in self.__dict__:
-            self.logit_rank = float("inf")
-        if "gumbel_rank" not in self.__dict__:
-            self.gumbel_rank = float("inf")
+    return data
 
 
 SCORE_KEY_TO_LABEL = {
@@ -65,21 +49,21 @@ SCORE_KEY_TO_LABEL = {
 }
 
 FILENAME_TO_LABEL = {
-    "vllm_bf16.pkl": "Trusted VLLM BF16",
-    "vllm_bf16_top_p_0_90.pkl": "Incorrect Top-P (0.90)",
-    "vllm_bf16_top_p_0_85.pkl": "Incorrect Top-P (0.85)",
-    "vllm_bf16_seed_43.pkl": "Incorrect Seed (43)",
-    "vllm_fp8.pkl": "Quantized VLLM FP8",
-    "vllm_4bit.pkl": "Quantized VLLM 4bit",
-    "vllm_fp8_kv.pkl": "Quantized VLLM KV Cache FP8",
-    "hf_bf16.pkl": "Trusted HF BF16",
-    "vllm_bf16_tp_2.pkl": "Trusted VLLM BF16 2 GPU Tensor Parallel",
-    "vllm_bf16_tp_4.pkl": "Trusted VLLM BF16 4 GPU Tensor Parallel",
-    "vllm_bf16_temperature_0_7.pkl": "Incorrect Temperature (0.7)",
-    "vllm_bf16_temperature_1_1.pkl": "Incorrect Temperature (1.1)",
-    "vllm_bf16_buggy.pkl": "Sampling Bug (Top-2 Bit Flip)",
-    "vllm_bf16_buggy_idx_3.pkl": "Sampling Bug (4th Top Token)",
-    "hf_bf16_stego.pkl": "Stego Attack HF BF16",
+    "vllm_bf16.json": "Trusted VLLM BF16",
+    "vllm_bf16_top_p_0_90.json": "Incorrect Top-P (0.90)",
+    "vllm_bf16_top_p_0_85.json": "Incorrect Top-P (0.85)",
+    "vllm_bf16_seed_43.json": "Incorrect Seed (43)",
+    "vllm_fp8.json": "Quantized VLLM FP8",
+    "vllm_4bit.json": "Quantized VLLM 4bit",
+    "vllm_fp8_kv.json": "Quantized VLLM KV Cache FP8",
+    "hf_bf16.json": "Trusted HF BF16",
+    "vllm_bf16_tp_2.json": "Trusted VLLM BF16 2 GPU Tensor Parallel",
+    "vllm_bf16_tp_4.json": "Trusted VLLM BF16 4 GPU Tensor Parallel",
+    "vllm_bf16_temperature_0_7.json": "Incorrect Temperature (0.7)",
+    "vllm_bf16_temperature_1_1.json": "Incorrect Temperature (1.1)",
+    "vllm_bf16_buggy.json": "Sampling Bug (Top-2 Bit Flip)",
+    "vllm_bf16_buggy_idx_3.json": "Sampling Bug (4th Top Token)",
+    "hf_bf16_stego.json": "Stego Attack HF BF16",
 }
 
 
@@ -248,7 +232,7 @@ def gather_untrusted_filenames(
 
     filenames = []
     for file in os.listdir(folder):
-        if file.endswith(".pkl"):
+        if file.endswith(".json"):
             if not any(pattern in file for pattern in exclude_patterns):
                 if len(include_patterns) > 0 and not any(pattern in file for pattern in include_patterns):
                     continue
@@ -344,8 +328,7 @@ def analyze_with_classifiers_by_file(
     # Load trusted reference data once
     trusted_filepath = os.path.join(folder, trusted_filename)
     print(f"Loading trusted reference: {trusted_filename}")
-    with open(trusted_filepath, "rb") as f:
-        trusted_data = pickle.load(f)
+    trusted_data = load_results(trusted_filepath)
     print(f"  Loaded {len(trusted_data['scores'])} sequences\n")
 
     # Prepare consistent styles across all subplots
@@ -373,8 +356,7 @@ def analyze_with_classifiers_by_file(
         print(f"Processing File: {label}")
         print(f"{'=' * 60}")
 
-        with open(filepath, "rb") as f:
-            comparison_data = pickle.load(f)
+        comparison_data = load_results(filepath)
 
         auc_by_key = {lbl: [] for lbl in score_labels_ordered}
 
@@ -513,13 +495,13 @@ if __name__ == "__main__":
 
     # Setup parameters
     if model_type == "Llama-3.1-8B":
-        trusted_filename = "verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.pkl"
+        trusted_filename = "verification_meta-llama_Llama-3_1-8B-Instruct_vllm_bf16.json"
     elif model_type == "Qwen3-8B":
-        trusted_filename = "verification_Qwen_Qwen3-8B_vllm_bf16.pkl"
+        trusted_filename = "verification_Qwen_Qwen3-8B_vllm_bf16.json"
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-    filename_stub = trusted_filename.split("vllm_bf16.pkl")[0]
+    filename_stub = trusted_filename.split("vllm_bf16.json")[0]
     folder = specific_local_path
     image_folder = f"images_line_plots_auc_vs_bucket_{model_type}"
 
