@@ -361,6 +361,65 @@ def generate_outputs_vllm(
     return outputs
 
 
+def verify_vllm_gumbel_max(
+    temperature: float,
+    seed: int,
+    logits_JV: torch.Tensor,
+    probs_JV: torch.Tensor,
+    gold_col_idx_J: torch.Tensor,
+    top_k_tensor_J: torch.Tensor,
+    top_p_tensor_J: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Verify the outputs against vLLM's Gumbel-Max sampling.
+    """
+
+    # Create per-request generator for verification
+    generator = torch.Generator(device=logits_JV.device)
+
+    J = logits_JV.shape[0]
+    row_idx_J = torch.arange(J, device=logits_JV.device)
+
+    # Sample all Exponential(1) noises with consistent generator usage
+    # Must be done row-by-row to match vLLM's token-by-token RNG order
+    generator.manual_seed(seed)
+    exponential_rows = []
+    for _ in range(J):
+        exp_v = torch.empty_like(probs_JV[0])
+        exp_v.exponential_(generator=generator)
+        exponential_rows.append(exp_v)
+    random_exponentials_JV = torch.stack(exponential_rows, dim=0)
+
+    gumbel_max_scores_JV = probs_JV / random_exponentials_JV
+    # With full vocab, column index is the token ID
+    pred_ids_J = gumbel_max_scores_JV.argmax(dim=-1)
+
+    # Track whether the gold token was removed by top-k/top-p filtering.
+    filtered_logits_JV = apply_top_k_top_p(logits_JV.clone(), top_k_tensor_J, top_p_tensor_J)
+    gold_filtered_J = ~torch.isfinite(filtered_logits_JV[row_idx_J, gold_col_idx_J])
+
+    # Rank of the gold token in the Gumbel-Max scores (0 = highest score).
+    gold_gumbel_scores_J = gumbel_max_scores_JV[row_idx_J, gold_col_idx_J]
+    gumbel_ranks_J = torch.full((J,), float("inf"), device=logits_JV.device)
+    valid_mask_J = ~gold_filtered_J
+    if valid_mask_J.any():
+        higher_scores_counts = (
+            gumbel_max_scores_JV[valid_mask_J] > gold_gumbel_scores_J[valid_mask_J].unsqueeze(1)
+        ).sum(dim=1)
+        gumbel_ranks_J[valid_mask_J] = higher_scores_counts.float()
+
+    margins_J = compute_margin_batch(
+        logits_JV.clone(),
+        random_exponentials_JV,
+        temperature=temperature,
+        top_k_vec=top_k_tensor_J,
+        top_p_vec=top_p_tensor_J,
+        gold_idx_J=gold_col_idx_J,
+    )
+
+    return pred_ids_J, gumbel_ranks_J, margins_J
+
+
 @torch.inference_mode()
 def verify_outputs(
     outputs: list[TokenSequence],
@@ -399,9 +458,6 @@ def verify_outputs(
 
     all_token_metrics: list[list[SimpleTokenMetrics]] = []
 
-    # Create per-request generator for verification
-    generator = torch.Generator(device=device_for_inputs)
-
     # Batch work across generated tokens per request for speed.
     for i in tqdm(range(0, len(outputs)), desc="Verifying outputs"):
         req = outputs[i]
@@ -433,57 +489,30 @@ def verify_outputs(
 
         J = logits_JV.shape[0]
         # With full vocab tensor, token ID is the column index
-        gold_col_idx = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
+        gold_col_idx_J = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
 
-        top_k_tensor = torch.full((J,), cfg.top_k, device=logits_JV.device, dtype=torch.long)
-        top_p_tensor = torch.full((J,), cfg.verification_top_p, device=logits_JV.device, dtype=logits_JV.dtype)
+        top_k_tensor_J = torch.full((J,), cfg.top_k, device=logits_JV.device, dtype=torch.long)
+        top_p_tensor_J = torch.full((J,), cfg.verification_top_p, device=logits_JV.device, dtype=logits_JV.dtype)
 
         logits_JV = logits_JV.float()
-        probs_JV = get_probs(logits_JV, cfg.verification_temperature, top_k_tensor, top_p_tensor)
+        probs_JV = get_probs(logits_JV, cfg.verification_temperature, top_k_tensor_J, top_p_tensor_J)
 
         # Rank of the gold token in the raw logits (0 = highest logit).
         row_idx_J = torch.arange(J, device=device_for_inputs)
-        gold_logits_J = logits_JV[row_idx_J, gold_col_idx]
+        gold_logits_J = logits_JV[row_idx_J, gold_col_idx_J]
         logit_ranks_J = (logits_JV > gold_logits_J.unsqueeze(1)).sum(dim=1).float()
 
-        # Track whether the gold token was removed by top-k/top-p filtering.
-        filtered_logits_JV = apply_top_k_top_p(logits_JV.clone(), top_k_tensor, top_p_tensor)
-        gold_filtered_J = ~torch.isfinite(filtered_logits_JV[row_idx_J, gold_col_idx])
+        probs_gold_J = probs_JV.gather(1, gold_col_idx_J.view(-1, 1)).squeeze(1)
 
-        # Sample all Exponential(1) noises with consistent generator usage
-        # Must be done row-by-row to match vLLM's token-by-token RNG order
-        generator.manual_seed(cfg.verification_seed)
-        exponential_rows = []
-        for _ in range(J):
-            exp_v = torch.empty_like(probs_JV[0])
-            exp_v.exponential_(generator=generator)
-            exponential_rows.append(exp_v)
-        random_exponentials_JV = torch.stack(exponential_rows, dim=0)
-
-        gumbel_max_scores_JV = probs_JV / random_exponentials_JV
-        # With full vocab, column index is the token ID
-        pred_ids_J = gumbel_max_scores_JV.argmax(dim=-1)
-
-        # Rank of the gold token in the Gumbel-Max scores (0 = highest score).
-        gold_gumbel_scores_J = gumbel_max_scores_JV[row_idx_J, gold_col_idx]
-        gumbel_ranks_J = torch.full((J,), float("inf"), device=device_for_inputs)
-        valid_mask_J = ~gold_filtered_J
-        if valid_mask_J.any():
-            higher_scores_counts = (
-                gumbel_max_scores_JV[valid_mask_J] > gold_gumbel_scores_J[valid_mask_J].unsqueeze(1)
-            ).sum(dim=1)
-            gumbel_ranks_J[valid_mask_J] = higher_scores_counts.float()
-
-        margins_J = compute_margin_batch(
-            logits_JV.clone(),
-            random_exponentials_JV,
+        pred_ids_J, gumbel_ranks_J, margins_J = verify_vllm_gumbel_max(
             temperature=cfg.verification_temperature,
-            top_k_vec=top_k_tensor,
-            top_p_vec=top_p_tensor,
-            gold_idx_J=gold_col_idx,
+            seed=cfg.verification_seed,
+            logits_JV=logits_JV,
+            probs_JV=probs_JV,
+            gold_col_idx_J=gold_col_idx_J,
+            top_k_tensor_J=top_k_tensor_J,
+            top_p_tensor_J=top_p_tensor_J,
         )
-
-        probs_gold_J = probs_JV.gather(1, gold_col_idx.view(-1, 1)).squeeze(1)
 
         seq_token_metrics: list[SimpleTokenMetrics] = []
         for j in range(J):
@@ -683,19 +712,19 @@ if __name__ == "__main__":
     #     )
     # )
 
-    external_prompt_filename = (
-        "openrouter_responses/openrouter_groq_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
-    )
+    # external_prompt_filename = (
+    #     "openrouter_responses/openrouter_groq_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
+    # )
 
-    external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
+    # external_save_filename = external_prompt_filename.split("/")[-1].split(".")[0]
 
-    cfgs.append(
-        AttestationConfig(
-            save_filename=f"verification_{external_save_filename}.json",
-            trusted_model_name=model_name,
-            external_prompt_filename=external_prompt_filename,
-        )
-    )
+    # cfgs.append(
+    #     AttestationConfig(
+    #         save_filename=f"verification_{external_save_filename}.json",
+    #         trusted_model_name=model_name,
+    #         external_prompt_filename=external_prompt_filename,
+    #     )
+    # )
 
     # external_prompt_filename = (
     #     "openrouter_responses/openrouter_hyperbolic_meta-llama_llama-3_1-8b-instruct_token_difr_prompts.json"
