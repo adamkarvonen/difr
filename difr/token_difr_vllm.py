@@ -456,25 +456,33 @@ def verify_outputs(
 
     device_for_inputs = torch.device("cuda")
 
-    all_token_metrics: list[list[SimpleTokenMetrics]] = []
+    # === First pass: build all prompts for batched generation ===
+    verify_prompts: list[TokensPrompt] = []
+    request_metadata: list[tuple[int, int, list[int]]] = []  # (original_idx, prompt_len, gen_ids)
 
-    # Batch work across generated tokens per request for speed.
-    for i in tqdm(range(0, len(outputs)), desc="Verifying outputs"):
-        req = outputs[i]
-
+    for i, req in enumerate(tqdm(outputs, desc="Preparing verification prompts")):
         prompt_token_ids: list[int] = _as_list(req.prompt_token_ids)
         gen_ids: list[int] = _as_list(req.output_token_ids)
-        gen_only: list[int] = _as_list(req.output_token_ids)
-        seq_concat: list[int] = prompt_token_ids + gen_ids
 
-        prompt_len = len(prompt_token_ids)
-        gen_len = len(gen_ids)
-
-        if gen_len == 0:
+        if len(gen_ids) == 0:
             continue
 
-        verify_prompts: list[TokensPrompt] = [{"prompt_token_ids": seq_concat}]
-        verify_req = model.generate(verify_prompts, sampling_params=prompt_logprob_params, use_tqdm=False)[0]
+        seq_concat: list[int] = prompt_token_ids + gen_ids
+        verify_prompts.append({"prompt_token_ids": seq_concat})
+        request_metadata.append((i, len(prompt_token_ids), gen_ids))
+
+    # === Batched generation ===
+    print(f"Running batched verification for {len(verify_prompts)} sequences...")
+    verify_results = model.generate(verify_prompts, sampling_params=prompt_logprob_params)
+
+    # === Second pass: compute metrics from results ===
+    all_token_metrics: list[list[SimpleTokenMetrics]] = []
+
+    for batch_idx, (orig_idx, prompt_len, gen_ids) in enumerate(
+        tqdm(request_metadata, desc="Computing verification metrics")
+    ):
+        verify_req = verify_results[batch_idx]
+        gen_len = len(gen_ids)
 
         if verify_req.prompt_logprobs is None:
             raise ValueError("vLLM did not return prompt_logprobs; enable prompt_logprobs in SamplingParams.")
@@ -489,7 +497,7 @@ def verify_outputs(
 
         J = logits_JV.shape[0]
         # With full vocab tensor, token ID is the column index
-        gold_col_idx_J = torch.as_tensor(gen_only, device=device_for_inputs, dtype=torch.long)
+        gold_col_idx_J = torch.as_tensor(gen_ids, device=device_for_inputs, dtype=torch.long)
 
         top_k_tensor_J = torch.full((J,), cfg.top_k, device=logits_JV.device, dtype=torch.long)
         top_p_tensor_J = torch.full((J,), cfg.verification_top_p, device=logits_JV.device, dtype=logits_JV.dtype)
@@ -516,7 +524,7 @@ def verify_outputs(
 
         seq_token_metrics: list[SimpleTokenMetrics] = []
         for j in range(J):
-            actual_id = int(gen_only[j])
+            actual_id = int(gen_ids[j])
 
             token_metrics = SimpleTokenMetrics(
                 exact_match=bool(int(pred_ids_J[j]) == actual_id),
