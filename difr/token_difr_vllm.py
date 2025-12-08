@@ -179,7 +179,7 @@ def get_probs(logits: torch.Tensor, temperature: float, top_k: torch.Tensor, top
     returns: probabilities with same shape, normalized along the last dim
     """
 
-    assert len(logits.shape) == 2, print(f"Expected 2D logits, got shape {logits.shape}")
+    assert len(logits.shape) == 2, f"Expected 2D logits, got shape {logits.shape}"
 
     if temperature > 0.0:
         x = logits / max(temperature, 1e-8)
@@ -201,9 +201,8 @@ def get_probs(logits: torch.Tensor, temperature: float, top_k: torch.Tensor, top
 def compute_margin_batch(
     logits_JV: torch.Tensor,
     random_exponentials_JV: torch.Tensor,
+    neg_inf_mask_JV: torch.Tensor,
     temperature: float,
-    top_k_vec: torch.Tensor,
-    top_p_vec: torch.Tensor,
     gold_idx_J: torch.Tensor,
 ) -> torch.Tensor:
     """
@@ -212,19 +211,8 @@ def compute_margin_batch(
     assert logits_JV.dim() == 2, f"Expected [J, V] logits, got {logits_JV.shape}"
     J, V = logits_JV.shape
 
-    temp_logits_JV = logits_JV.clone()
-
-    # vllm scales logits by 1/temperature before top-k/top-p, so we do it here too
-    # note: We do NOT scale the real logits by temperature - otherwise the noise would vary significantly
-    # with temperature as well
-    if temperature > 0.0:
-        temp_logits_JV = temp_logits_JV / max(temperature, 1e-8)
-
-    # Apply top-k/top-p to build the mask; requires per-row k/p tensors.
-    temp_logits_JV = apply_top_k_top_p(temp_logits_JV, top_k_vec, top_p_vec)
-    neg_inf_mask_JV = ~torch.isfinite(temp_logits_JV)
-
     # Add Gumbel noise to logits and re-apply mask
+    # epsilon is 0 because torch.exponential_() will not generate 0
     random_gumbels_JV = exponential_to_gumbel(random_exponentials_JV.float(), epsilon=0)
     noised_logits_JV = logits_JV + (random_gumbels_JV * temperature)
     noised_logits_JV[neg_inf_mask_JV] = float("-inf")
@@ -374,6 +362,18 @@ def verify_vllm_gumbel_max(
     Verify the outputs against vLLM's Gumbel-Max sampling.
     """
 
+    filtered_logits_JV = logits_JV.clone()
+
+    # vllm scales logits by 1/temperature before top-k/top-p, so we do it here too
+    # note: We do NOT scale the real logits by temperature - otherwise the noise would vary significantly
+    # with temperature as well
+    if temperature > 0.0:
+        filtered_logits_JV = filtered_logits_JV / max(temperature, 1e-8)
+
+    # Apply top-k/top-p to build the mask; requires per-row k/p tensors.
+    filtered_logits_JV = apply_top_k_top_p(filtered_logits_JV, top_k_tensor_J, top_p_tensor_J)
+    neg_inf_mask_JV = ~torch.isfinite(filtered_logits_JV)
+
     # Create per-request generator for verification
     generator = torch.Generator(device=logits_JV.device)
 
@@ -395,7 +395,6 @@ def verify_vllm_gumbel_max(
     pred_ids_J = gumbel_max_scores_JV.argmax(dim=-1)
 
     # Track whether the gold token was removed by top-k/top-p filtering.
-    filtered_logits_JV = apply_top_k_top_p(logits_JV.clone(), top_k_tensor_J, top_p_tensor_J)
     gold_filtered_J = ~torch.isfinite(filtered_logits_JV[row_idx_J, gold_col_idx_J])
 
     # Rank of the gold token in the Gumbel-Max scores (0 = highest score).
@@ -409,11 +408,10 @@ def verify_vllm_gumbel_max(
         gumbel_ranks_J[valid_mask_J] = higher_scores_counts.float()
 
     margins_J = compute_margin_batch(
-        logits_JV.clone(),
+        logits_JV,
         random_exponentials_JV,
+        neg_inf_mask_JV=neg_inf_mask_JV,
         temperature=temperature,
-        top_k_vec=top_k_tensor_J,
-        top_p_vec=top_p_tensor_J,
         gold_idx_J=gold_col_idx_J,
     )
 
@@ -476,7 +474,8 @@ def verify_outputs(
     verify_results = model.generate(verify_prompts, sampling_params=prompt_logprob_params)
 
     # === Second pass: compute metrics from results ===
-    all_token_metrics: list[list[SimpleTokenMetrics]] = []
+    # Pre-initialize with empty lists to maintain positional correspondence
+    all_token_metrics: list[list[SimpleTokenMetrics]] = [[] for _ in outputs]
 
     for batch_idx, (orig_idx, prompt_len, gen_ids) in enumerate(
         tqdm(request_metadata, desc="Computing verification metrics")
@@ -535,16 +534,19 @@ def verify_outputs(
             )
             seq_token_metrics.append(token_metrics)
 
-        all_token_metrics.append(seq_token_metrics)
+        all_token_metrics[orig_idx] = seq_token_metrics
+
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return all_token_metrics
 
 
 def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str], list[list[dict[str, str]]]]:
     tokenizer = AutoTokenizer.from_pretrained(cfg.trusted_model_name)
-    tokenizer.padding_side = "left"
 
-    ds = load_dataset(cfg.dataset_name, split="train")
+    ds = load_dataset(cfg.dataset_name, split=cfg.dataset_split)
 
     # prepare raw prompts (chat template -> text -> token ids)
 
@@ -560,6 +562,7 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
         raw_prompt = ds[count]["conversation"]  # type: ignore[index]
 
         # Check language before processing
+        # do english so I can read the results
         if ds[count]["language"].lower() != "english":  # type: ignore[index]
             count += 1
             continue
@@ -574,9 +577,6 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
         while conversation and conversation[-1].get("role") == "assistant":
             conversation = conversation[:-1]
 
-        if "qwen" in cfg.trusted_model_name.lower():
-            conversation[-1]["content"] = conversation[-1]["content"] + "/nothink"
-
         # Skip if conversation is empty or doesn't end with user
         if not conversation or conversation[-1].get("role") != "user":
             continue
@@ -590,7 +590,6 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
                 hf_prompts.append(rendered_prompt)
                 conversation_prompts.append(conversation)
 
-    # We haven't properly set the pad token yet so we need to delete the tokenizer
     del tokenizer
 
     return tokenized_prompts, hf_prompts, conversation_prompts
@@ -599,12 +598,9 @@ def construct_dataset(cfg: AttestationConfig) -> tuple[list[list[int]], list[str
 def load_external_tokens(data_path: str) -> list[TokenSequence]:
     """Load external tokenized data from JSON file.
 
-    Supports two formats:
-    1. New format with output_token_ids:
+    Supports the following format:
         {"samples": [{"prompt_token_ids": [...], "output_token_ids": [...]}, ...]}
 
-    2. Legacy format with nested outputs:
-        {"samples": [{"prompt_token_ids": [...], "outputs": [{"token_ids": [...]}]}, ...]}
 
     Args:
         data_path: Path to the JSON file containing tokenized data
@@ -621,13 +617,7 @@ def load_external_tokens(data_path: str) -> list[TokenSequence]:
     for sample in data["samples"]:
         assert "prompt_token_ids" in sample, "prompt_token_ids not found in sample"
 
-        # Support both new format (output_token_ids) and legacy format (outputs[0].token_ids)
-        if "output_token_ids" in sample:
-            output_ids = sample["output_token_ids"]
-        elif "outputs" in sample:
-            output_ids = sample["outputs"][0]["token_ids"]
-        else:
-            raise ValueError("Sample must have either 'output_token_ids' or 'outputs'")
+        output_ids = sample["output_token_ids"]
 
         outputs.append(
             TokenSequence(
